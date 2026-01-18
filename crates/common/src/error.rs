@@ -11,6 +11,9 @@ pub enum Error {
     #[error("invalid packet")]
     InvalidPacket,
 
+    #[error("replayed or out-of-order packet")]
+    ReplayedPacket,
+
     #[error("handshake not completed")]
     HandshakeNotCompleted,
 

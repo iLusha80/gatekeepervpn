@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice,
-    print_nat_instructions,
+    Error as CommonError, Packet, PacketType, Responder, ServerConfig, Transport, TunConfig,
+    TunDevice, VpnErrorLoggers, configure_socket, print_nat_instructions,
 };
 
 #[derive(Parser, Debug)]
@@ -102,6 +102,7 @@ fn load_config(path: &str) -> Result<ServerConfig> {
 /// Echo mode: just echo back decrypted data
 async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Result<()> {
     let mut buf = vec![0u8; 65535];
+    let error_loggers = VpnErrorLoggers::new();
 
     loop {
         // Wait for packet or shutdown signal
@@ -165,7 +166,17 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("[{}] Decrypt error: {}", addr, e);
+                                    // Differentiate between replay and crypto errors
+                                    if matches!(e, CommonError::ReplayedPacket) {
+                                        error_loggers.decrypt_replay.debug(&format!(
+                                            "[{}] Replayed/out-of-order packet dropped",
+                                            addr
+                                        ));
+                                    } else {
+                                        error_loggers
+                                            .decrypt_crypto
+                                            .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                    }
                                     None
                                 }
                             }
@@ -237,10 +248,15 @@ async fn run_vpn_mode(
 
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 
+    // Rate-limited error loggers
+    let error_loggers = Arc::new(VpnErrorLoggers::new());
+
     let socket_tx = socket.clone();
     let socket_rx = socket;
     let server_tx = server.clone();
     let server_rx = server;
+    let loggers_rx = error_loggers.clone();
+    let loggers_tx = error_loggers;
 
     // Task 1: UDP -> TUN (incoming from clients)
     let udp_to_tun = tokio::spawn(async move {
@@ -287,11 +303,23 @@ async fn run_vpn_mode(
                             Ok(plaintext) => {
                                 log::debug!("[{}] UDP -> TUN: {} bytes", addr, plaintext.len());
                                 if let Err(e) = tun_writer.write(&plaintext).await {
-                                    log::error!("TUN write error: {}", e);
+                                    loggers_rx
+                                        .tun_write
+                                        .warn(&format!("TUN write error: {}", e));
                                 }
                             }
                             Err(e) => {
-                                log::error!("[{}] Decrypt error: {}", addr, e);
+                                // Differentiate between replay and crypto errors
+                                if matches!(e, CommonError::ReplayedPacket) {
+                                    loggers_rx.decrypt_replay.debug(&format!(
+                                        "[{}] Replayed/out-of-order packet dropped",
+                                        addr
+                                    ));
+                                } else {
+                                    loggers_rx
+                                        .decrypt_crypto
+                                        .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                }
                             }
                         }
                     } else {
@@ -355,7 +383,9 @@ async fn run_vpn_mode(
                         Ok(encrypted) => {
                             let packet = Packet::data(encrypted);
                             if let Err(e) = socket_tx.send_to(&packet.encode(), addr).await {
-                                log::error!("[{}] UDP send error: {}", addr, e);
+                                loggers_tx
+                                    .udp_send
+                                    .warn(&format!("[{}] UDP send error: {}", addr, e));
                             }
                         }
                         Err(e) => {
@@ -408,6 +438,11 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind(&config.listen)
         .await
         .with_context(|| format!("Failed to bind to {}", config.listen))?;
+
+    // Configure socket buffers for high-throughput
+    if let Err(e) = configure_socket(&socket) {
+        log::warn!("Failed to configure socket buffers: {}", e);
+    }
 
     log::info!("GatekeeperVPN server listening on {}", config.listen);
 

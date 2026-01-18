@@ -14,8 +14,8 @@ use tokio::time::{interval, timeout};
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    ClientConfig, Initiator, Packet, PacketType, RouteConfig, Transport, TunConfig, TunDevice,
-    cleanup_routes, setup_routes,
+    ClientConfig, Error as CommonError, Initiator, Packet, PacketType, RouteConfig, Transport,
+    TunConfig, TunDevice, VpnErrorLoggers, cleanup_routes, configure_socket, setup_routes,
 };
 
 #[derive(Parser, Debug)]
@@ -228,6 +228,9 @@ async fn run_vpn_mode(
     let conn_state = Arc::new(ConnectionState::new());
     conn_state.update_last_received(); // Initial timestamp
 
+    // Rate-limited error loggers
+    let error_loggers = Arc::new(VpnErrorLoggers::new());
+
     // Clone for tasks
     let socket_tx = socket.clone();
     let socket_rx = socket.clone();
@@ -236,6 +239,8 @@ async fn run_vpn_mode(
     let transport_rx = transport;
     let conn_state_rx = conn_state.clone();
     let conn_state_ka = conn_state;
+    let loggers_tx = error_loggers.clone();
+    let loggers_rx = error_loggers;
 
     let keepalive_interval = config.keepalive_interval;
     let keepalive_timeout = config.keepalive_timeout;
@@ -270,7 +275,8 @@ async fn run_vpn_mode(
 
             let packet = Packet::data(encrypted);
             if let Err(e) = socket_tx.send(&packet.encode()).await {
-                log::error!("UDP send error: {}", e);
+                // Rate-limited warning for buffer overflow (common during bursts)
+                loggers_tx.udp_send.warn(&format!("UDP send error: {}", e));
             }
         }
     });
@@ -309,7 +315,18 @@ async fn run_vpn_mode(
                         match transport.decrypt(&packet.payload) {
                             Ok(data) => data,
                             Err(e) => {
-                                log::error!("Decrypt error: {}", e);
+                                // Differentiate between replay and crypto errors
+                                if matches!(e, CommonError::ReplayedPacket) {
+                                    // Replayed/out-of-order packets are normal in UDP
+                                    loggers_rx
+                                        .decrypt_replay
+                                        .debug(&format!("Replayed/out-of-order packet dropped"));
+                                } else {
+                                    // Actual crypto errors are more concerning
+                                    loggers_rx
+                                        .decrypt_crypto
+                                        .warn(&format!("Decrypt error: {}", e));
+                                }
                                 continue;
                             }
                         }
@@ -319,7 +336,9 @@ async fn run_vpn_mode(
 
                     // Write to TUN
                     if let Err(e) = tun_writer.write(&plaintext).await {
-                        log::error!("TUN write error: {}", e);
+                        loggers_rx
+                            .tun_write
+                            .warn(&format!("TUN write error: {}", e));
                     }
                 }
                 PacketType::KeepAliveAck => {
@@ -402,6 +421,11 @@ async fn run_vpn_connection(
         .connect(&config.server)
         .await
         .with_context(|| format!("Failed to connect to {}", config.server))?;
+
+    // Configure socket buffers for high-throughput
+    if let Err(e) = configure_socket(&socket) {
+        log::warn!("Failed to configure socket buffers: {}", e);
+    }
 
     log::info!("Connecting to server: {}", config.server);
 

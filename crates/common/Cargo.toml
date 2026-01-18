@@ -20,6 +20,7 @@ thiserror.workspace = true
 
 # Network
 tun.workspace = true
+socket2.workspace = true
 
 # Async & Logging
 tokio = { workspace = true, features = ["io-util"] }

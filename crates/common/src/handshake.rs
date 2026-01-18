@@ -249,7 +249,9 @@ impl Transport {
         buf[..COUNTER_SIZE].copy_from_slice(&counter.to_le_bytes());
 
         // Encrypt with counter as nonce
-        let len = self.state.write_message(counter, plaintext, &mut buf[COUNTER_SIZE..])?;
+        let len = self
+            .state
+            .write_message(counter, plaintext, &mut buf[COUNTER_SIZE..])?;
         buf.truncate(COUNTER_SIZE + len);
 
         Ok(buf)
@@ -268,7 +270,7 @@ impl Transport {
 
         // Check replay protection
         if !self.recv_window.check_and_mark(counter) {
-            return Err(Error::Crypto(snow::Error::Decrypt));
+            return Err(Error::ReplayedPacket);
         }
 
         // Decrypt
