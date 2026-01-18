@@ -1,17 +1,18 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{timeout, interval};
 
 use gatekeeper_common::config::keys;
-use gatekeeper_common::{ClientConfig, Initiator, Packet, PacketType, Transport, TunConfig, TunDevice};
+use gatekeeper_common::{ClientConfig, Initiator, Packet, PacketType, RouteConfig, Transport, TunConfig, TunDevice, cleanup_routes, setup_routes};
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-client")]
@@ -134,6 +135,34 @@ async fn run_test_mode(
     Ok(())
 }
 
+/// Shared state for connection tracking
+struct ConnectionState {
+    /// Timestamp of last received packet (as seconds since start)
+    last_received: AtomicU64,
+    /// Start time for timestamp calculations
+    start_time: Instant,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            last_received: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn update_last_received(&self) {
+        let elapsed = self.start_time.elapsed().as_secs();
+        self.last_received.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn seconds_since_last_received(&self) -> u64 {
+        let elapsed = self.start_time.elapsed().as_secs();
+        let last = self.last_received.load(Ordering::Relaxed);
+        elapsed.saturating_sub(last)
+    }
+}
+
 /// VPN mode: tunnel traffic through TUN interface
 async fn run_vpn_mode(
     socket: Arc<UdpSocket>,
@@ -159,14 +188,46 @@ async fn run_vpn_mode(
 
     log::info!("VPN tunnel established on {}", tun_device.name());
 
+    // Setup routes if configured
+    let server_ip: Ipv4Addr = config.server
+        .split(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .context("Invalid server IP in config")?;
+
+    let route_config = RouteConfig {
+        tun_name: tun_device.name().to_string(),
+        tun_gateway: tun_address,
+        server_ip,
+        route_all_traffic: config.route_all_traffic,
+        routed_subnets: config.routed_subnets.clone(),
+    };
+
+    if config.route_all_traffic || !config.routed_subnets.is_empty() {
+        if let Err(e) = setup_routes(&route_config) {
+            log::error!("Failed to setup routes: {}", e);
+            log::warn!("Continuing without routing - you may need to configure routes manually");
+        }
+    }
+
     // Split TUN device for concurrent read/write
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 
+    // Shared connection state
+    let conn_state = Arc::new(ConnectionState::new());
+    conn_state.update_last_received(); // Initial timestamp
+
     // Clone for tasks
     let socket_tx = socket.clone();
-    let socket_rx = socket;
+    let socket_rx = socket.clone();
+    let socket_ka = socket;
     let transport_tx = transport.clone();
     let transport_rx = transport;
+    let conn_state_rx = conn_state.clone();
+    let conn_state_ka = conn_state;
+
+    let keepalive_interval = config.keepalive_interval;
+    let keepalive_timeout = config.keepalive_timeout;
 
     // Task 1: TUN -> UDP (outgoing traffic)
     let outgoing = tokio::spawn(async move {
@@ -217,6 +278,9 @@ async fn run_vpn_mode(
                 }
             };
 
+            // Update connection state
+            conn_state_rx.update_last_received();
+
             // Decode packet
             let packet = match Packet::decode(Bytes::copy_from_slice(&buf[..n])) {
                 Ok(p) => p,
@@ -226,39 +290,105 @@ async fn run_vpn_mode(
                 }
             };
 
-            if packet.packet_type != PacketType::Data {
-                log::warn!("Unexpected packet type: {:?}", packet.packet_type);
-                continue;
-            }
+            match packet.packet_type {
+                PacketType::Data => {
+                    // Decrypt
+                    let plaintext = {
+                        let mut transport = transport_rx.lock().await;
+                        match transport.decrypt(&packet.payload) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                log::error!("Decrypt error: {}", e);
+                                continue;
+                            }
+                        }
+                    };
 
-            // Decrypt
-            let plaintext = {
-                let mut transport = transport_rx.lock().await;
-                match transport.decrypt(&packet.payload) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::error!("Decrypt error: {}", e);
-                        continue;
+                    log::debug!("UDP -> TUN: {} bytes", plaintext.len());
+
+                    // Write to TUN
+                    if let Err(e) = tun_writer.write(&plaintext).await {
+                        log::error!("TUN write error: {}", e);
                     }
                 }
-            };
-
-            log::debug!("UDP -> TUN: {} bytes", plaintext.len());
-
-            // Write to TUN
-            if let Err(e) = tun_writer.write(&plaintext).await {
-                log::error!("TUN write error: {}", e);
+                PacketType::KeepAliveAck => {
+                    log::debug!("KeepAliveAck received");
+                }
+                _ => {
+                    log::warn!("Unexpected packet type: {:?}", packet.packet_type);
+                }
             }
         }
     });
 
-    // Wait for either task to finish (shouldn't happen normally)
+    // Task 3: Keep-alive sender
+    let keepalive = tokio::spawn(async move {
+        if keepalive_interval == 0 {
+            log::info!("Keep-alive disabled");
+            return;
+        }
+
+        log::info!("Keep-alive enabled: interval={}s, timeout={}s", keepalive_interval, keepalive_timeout);
+
+        let mut ticker = interval(Duration::from_secs(keepalive_interval));
+
+        loop {
+            ticker.tick().await;
+
+            // Check timeout
+            let since_last = conn_state_ka.seconds_since_last_received();
+            if since_last > keepalive_timeout {
+                log::error!("Connection timeout: no response for {} seconds", since_last);
+                break;
+            }
+
+            // Send keep-alive
+            let packet = Packet::keep_alive();
+            if let Err(e) = socket_ka.send(&packet.encode()).await {
+                log::error!("Failed to send keep-alive: {}", e);
+            } else {
+                log::debug!("KeepAlive sent");
+            }
+        }
+    });
+
+    // Wait for any task to finish
     tokio::select! {
         _ = outgoing => log::error!("Outgoing task finished unexpectedly"),
         _ = incoming => log::error!("Incoming task finished unexpectedly"),
+        _ = keepalive => log::error!("Keep-alive task finished (connection timeout)"),
+    }
+
+    // Cleanup routes
+    if config.route_all_traffic || !config.routed_subnets.is_empty() {
+        if let Err(e) = cleanup_routes(&route_config) {
+            log::error!("Failed to cleanup routes: {}", e);
+        }
     }
 
     Ok(())
+}
+
+/// Single connection attempt (connect, handshake, run VPN)
+async fn run_vpn_connection(
+    config: &ClientConfig,
+    private_key: &[u8],
+    server_public_key: &[u8],
+) -> Result<()> {
+    // Create UDP socket
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(&config.server).await
+        .with_context(|| format!("Failed to connect to {}", config.server))?;
+
+    log::info!("Connecting to server: {}", config.server);
+
+    // Perform handshake
+    let transport = perform_handshake(&socket, private_key, server_public_key).await?;
+
+    // VPN mode
+    let socket = Arc::new(socket);
+    let transport = Arc::new(Mutex::new(transport));
+    run_vpn_mode(socket, transport, config).await
 }
 
 #[tokio::main]
@@ -292,25 +422,53 @@ async fn main() -> Result<()> {
     let server_public_key = keys::decode(&config.server_public_key)
         .context("Invalid server public key format")?;
 
-    // Create UDP socket
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(&config.server).await
-        .with_context(|| format!("Failed to connect to {}", config.server))?;
-
-    log::info!("Connecting to server: {}", config.server);
-
-    // Perform handshake
-    let transport = perform_handshake(&socket, &private_key, &server_public_key).await?;
-
     if args.test {
-        // Test mode
-        let mut transport = transport;
+        // Test mode - single connection, no reconnect
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(&config.server).await
+            .with_context(|| format!("Failed to connect to {}", config.server))?;
+
+        log::info!("Connecting to server: {}", config.server);
+
+        let mut transport = perform_handshake(&socket, &private_key, &server_public_key).await?;
         run_test_mode(&socket, &mut transport, &args.message).await?;
     } else {
-        // VPN mode
-        let socket = Arc::new(socket);
-        let transport = Arc::new(Mutex::new(transport));
-        run_vpn_mode(socket, transport, &config).await?;
+        // VPN mode with reconnection support
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+
+            if config.max_reconnect_attempts > 0 && attempt > config.max_reconnect_attempts {
+                log::error!("Max reconnect attempts ({}) reached, giving up", config.max_reconnect_attempts);
+                break;
+            }
+
+            if attempt > 1 {
+                log::info!("Reconnection attempt {} (max: {})",
+                    attempt,
+                    if config.max_reconnect_attempts == 0 { "unlimited".to_string() } else { config.max_reconnect_attempts.to_string() }
+                );
+            }
+
+            match run_vpn_connection(&config, &private_key, &server_public_key).await {
+                Ok(()) => {
+                    log::info!("VPN connection ended normally");
+                    break;
+                }
+                Err(e) => {
+                    log::error!("VPN connection error: {}", e);
+
+                    if !config.reconnect_enabled {
+                        log::info!("Reconnection disabled, exiting");
+                        return Err(e);
+                    }
+
+                    log::info!("Waiting {} seconds before reconnecting...", config.reconnect_delay);
+                    tokio::time::sleep(Duration::from_secs(config.reconnect_delay)).await;
+                }
+            }
+        }
     }
 
     Ok(())

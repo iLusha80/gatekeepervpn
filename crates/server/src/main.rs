@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use gatekeeper_common::config::keys;
-use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice};
+use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice, print_nat_instructions};
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-server")]
@@ -165,6 +165,19 @@ async fn run_echo_mode(
                         }
                     }
                 }
+                PacketType::KeepAlive => {
+                    if server.clients.contains_key(&addr) {
+                        log::debug!("[{}] KeepAlive received", addr);
+                        Some(Packet::keep_alive_ack())
+                    } else {
+                        log::warn!("[{}] KeepAlive from unknown client", addr);
+                        None
+                    }
+                }
+                PacketType::KeepAliveAck => {
+                    log::debug!("[{}] Unexpected KeepAliveAck from client", addr);
+                    None
+                }
             }
         };
 
@@ -200,6 +213,12 @@ async fn run_vpn_mode(
         .context("Failed to create TUN device. Are you running as root?")?;
 
     log::info!("VPN server TUN interface: {}", tun_device.name());
+
+    // Print NAT setup instructions
+    // Simplified: assume /24 subnet based on server address (e.g., 10.0.0.1 -> 10.0.0.0/24)
+    let subnet = config.tun_address.rsplitn(2, '.').skip(1).next().unwrap_or("10.0.0");
+    let vpn_subnet = format!("{}.0/24", subnet);
+    print_nat_instructions(tun_device.name(), &vpn_subnet);
 
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 
@@ -266,6 +285,20 @@ async fn run_vpn_mode(
                         log::warn!("[{}] Data from unknown client", addr);
                     }
                 }
+                PacketType::KeepAlive => {
+                    if server.clients.contains_key(&addr) {
+                        log::debug!("[{}] KeepAlive received", addr);
+                        let response = Packet::keep_alive_ack();
+                        if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
+                            log::error!("[{}] Failed to send KeepAliveAck: {}", addr, e);
+                        }
+                    } else {
+                        log::warn!("[{}] KeepAlive from unknown client", addr);
+                    }
+                }
+                PacketType::KeepAliveAck => {
+                    log::debug!("[{}] Unexpected KeepAliveAck from client", addr);
+                }
             }
         }
     });
@@ -290,7 +323,7 @@ async fn run_vpn_mode(
 
             // Send to all connected clients (broadcast for simplicity)
             // A real VPN would route based on IP destination
-            for (addr, transport) in server.clients.iter() {
+            for (addr, _transport) in server.clients.iter() {
                 // Note: We need mutable access to transport for encryption
                 // This is a simplified version - real impl would use separate
                 // encryption state or lock per client

@@ -62,6 +62,27 @@ pub struct ClientConfig {
     /// TUN MTU
     #[serde(default = "default_tun_mtu")]
     pub tun_mtu: u16,
+    /// Keep-alive interval in seconds (0 to disable)
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
+    /// Keep-alive timeout in seconds (connection considered dead if no response)
+    #[serde(default = "default_keepalive_timeout")]
+    pub keepalive_timeout: u64,
+    /// Route all traffic through VPN (full tunnel)
+    #[serde(default)]
+    pub route_all_traffic: bool,
+    /// Specific subnets to route through VPN (if not routing all)
+    #[serde(default)]
+    pub routed_subnets: Vec<String>,
+    /// Enable automatic reconnection
+    #[serde(default = "default_reconnect_enabled")]
+    pub reconnect_enabled: bool,
+    /// Delay between reconnection attempts in seconds
+    #[serde(default = "default_reconnect_delay")]
+    pub reconnect_delay: u64,
+    /// Maximum number of reconnection attempts (0 = unlimited)
+    #[serde(default = "default_max_reconnect_attempts")]
+    pub max_reconnect_attempts: u32,
 }
 
 fn default_tun_address() -> String {
@@ -76,6 +97,26 @@ fn default_tun_mtu() -> u16 {
     1400
 }
 
+fn default_keepalive_interval() -> u64 {
+    25 // Send keep-alive every 25 seconds
+}
+
+fn default_keepalive_timeout() -> u64 {
+    60 // Consider connection dead after 60 seconds without response
+}
+
+fn default_reconnect_enabled() -> bool {
+    true
+}
+
+fn default_reconnect_delay() -> u64 {
+    5 // Wait 5 seconds before reconnecting
+}
+
+fn default_max_reconnect_attempts() -> u32 {
+    0 // Unlimited reconnect attempts
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -85,6 +126,13 @@ impl Default for ClientConfig {
             tun_address: default_tun_address(),
             tun_netmask: default_tun_netmask(),
             tun_mtu: default_tun_mtu(),
+            keepalive_interval: default_keepalive_interval(),
+            keepalive_timeout: default_keepalive_timeout(),
+            route_all_traffic: false,
+            routed_subnets: vec![],
+            reconnect_enabled: default_reconnect_enabled(),
+            reconnect_delay: default_reconnect_delay(),
+            max_reconnect_attempts: default_max_reconnect_attempts(),
         }
     }
 }

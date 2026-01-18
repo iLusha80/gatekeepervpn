@@ -22,4 +22,7 @@ pub enum Error {
 
     #[error("TUN device error: {0}")]
     Tun(String),
+
+    #[error("routing error: {0}")]
+    Route(String),
 }

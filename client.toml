@@ -1,3 +1,19 @@
-server = "127.0.0.1:51820"                                                                                                 
-private_key = ""                                                                                                           
-server_public_key = "JPgIlCMF2mN2MsDI9cjGKXNsnTnhgUFAWfzGjd4X1VI="
+server = "1.2.3.4:51820"                                                                                                   
+private_key = ""                                                                                                        
+server_public_key = "DRYYAry+bMNi1d+hHUWZb2HanFmf1Few+rM81+I2jjU="                                                                                               
+                                                                                                                            
+# TUN                                                                                                                      
+tun_address = "10.0.0.2"                                                                                                   
+tun_netmask = "255.255.255.0"                                                                                              
+                                                                                                                            
+# Keep-alive                                                                                                               
+keepalive_interval = 25                                                                                                    
+keepalive_timeout = 60                                                                                                     
+                                                                                                                            
+# Routing                                                                                                                  
+route_all_traffic = true                                                                                                   
+                                                                                                                            
+# Reconnect                                                                                                                
+reconnect_enabled = true                                                                                                   
+reconnect_delay = 5                                                                                                        
+max_reconnect_attempts = 0  # unlimited  

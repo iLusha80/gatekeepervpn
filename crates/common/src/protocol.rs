@@ -22,6 +22,10 @@ pub enum PacketType {
     HandshakeResponse = 2,
     /// Encrypted data packet
     Data = 3,
+    /// Keep-alive ping (client -> server)
+    KeepAlive = 4,
+    /// Keep-alive pong (server -> client)
+    KeepAliveAck = 5,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -32,6 +36,8 @@ impl TryFrom<u8> for PacketType {
             1 => Ok(PacketType::HandshakeInit),
             2 => Ok(PacketType::HandshakeResponse),
             3 => Ok(PacketType::Data),
+            4 => Ok(PacketType::KeepAlive),
+            5 => Ok(PacketType::KeepAliveAck),
             _ => Err(Error::InvalidPacket),
         }
     }
@@ -66,6 +72,16 @@ impl Packet {
     /// Create data packet
     pub fn data(payload: impl Into<Bytes>) -> Self {
         Self::new(PacketType::Data, payload)
+    }
+
+    /// Create keep-alive packet
+    pub fn keep_alive() -> Self {
+        Self::new(PacketType::KeepAlive, Bytes::new())
+    }
+
+    /// Create keep-alive acknowledgment packet
+    pub fn keep_alive_ack() -> Self {
+        Self::new(PacketType::KeepAliveAck, Bytes::new())
     }
 
     /// Encode packet to bytes
