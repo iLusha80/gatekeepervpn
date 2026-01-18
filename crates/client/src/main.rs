@@ -10,6 +10,7 @@ use clap::Parser;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, interval};
+use tokio::signal;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{ClientConfig, Initiator, Packet, PacketType, RouteConfig, Transport, TunConfig, TunDevice, cleanup_routes, setup_routes};
@@ -352,17 +353,23 @@ async fn run_vpn_mode(
         }
     });
 
-    // Wait for any task to finish
+    // Wait for any task to finish or shutdown signal
     tokio::select! {
         _ = outgoing => log::error!("Outgoing task finished unexpectedly"),
         _ = incoming => log::error!("Incoming task finished unexpectedly"),
         _ = keepalive => log::error!("Keep-alive task finished (connection timeout)"),
+        _ = signal::ctrl_c() => {
+            log::info!("Received shutdown signal (Ctrl+C)");
+        }
     }
 
     // Cleanup routes
+    log::info!("Cleaning up...");
     if config.route_all_traffic || !config.routed_subnets.is_empty() {
         if let Err(e) = cleanup_routes(&route_config) {
             log::error!("Failed to cleanup routes: {}", e);
+        } else {
+            log::info!("Routes cleaned up successfully");
         }
     }
 

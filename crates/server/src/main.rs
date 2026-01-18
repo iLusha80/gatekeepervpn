@@ -8,6 +8,7 @@ use bytes::Bytes;
 use clap::Parser;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use tokio::signal;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice, print_nat_instructions};
@@ -100,7 +101,15 @@ async fn run_echo_mode(
     let mut buf = vec![0u8; 65535];
 
     loop {
-        let (len, addr) = socket.recv_from(&mut buf).await?;
+        // Wait for packet or shutdown signal
+        let (len, addr) = tokio::select! {
+            result = socket.recv_from(&mut buf) => result?,
+            _ = signal::ctrl_c() => {
+                log::info!("Received shutdown signal (Ctrl+C)");
+                log::info!("Server shutting down...");
+                return Ok(());
+            }
+        };
         let data = Bytes::copy_from_slice(&buf[..len]);
 
         let packet = match Packet::decode(data) {
@@ -357,6 +366,10 @@ async fn run_vpn_mode(
     tokio::select! {
         _ = udp_to_tun => log::error!("UDP->TUN task finished unexpectedly"),
         _ = tun_to_udp => log::error!("TUN->UDP task finished unexpectedly"),
+        _ = signal::ctrl_c() => {
+            log::info!("Received shutdown signal (Ctrl+C)");
+            log::info!("Server shutting down...");
+        }
     }
 
     Ok(())
