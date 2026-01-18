@@ -1,0 +1,27 @@
+[Unit]
+Description=GatekeeperVPN Server
+Documentation=https://github.com/your-org/gatekeepervpn
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatekeeper-server -c /etc/gatekeeper/server.toml -p /etc/gatekeeper/peers.toml
+Restart=always
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65535
+
+# Security hardening (requires root for TUN)
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/gatekeeper
+
+# Environment
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,129 @@
 //! Configuration structures for server and client
 
+use std::net::Ipv4Addr;
+
 use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Peer Configuration (for per-client management)
+// ============================================================================
+
+/// Configuration for a single VPN peer (client)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Human-readable name (e.g., "laptop-ilya")
+    pub name: String,
+    /// Client's public key (base64 encoded)
+    pub public_key: String,
+    /// Assigned VPN IP address
+    pub assigned_ip: Ipv4Addr,
+    /// Creation timestamp (ISO 8601)
+    #[serde(default = "default_created_at")]
+    pub created_at: String,
+}
+
+fn default_created_at() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+impl PeerConfig {
+    /// Create a new peer config
+    pub fn new(name: String, public_key: String, assigned_ip: Ipv4Addr) -> Self {
+        Self {
+            name,
+            public_key,
+            assigned_ip,
+            created_at: default_created_at(),
+        }
+    }
+}
+
+/// Peers configuration file (peers.toml)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeersConfig {
+    /// Network address (e.g., "10.10.10.0")
+    pub subnet: String,
+    /// Subnet mask in CIDR notation (e.g., 24)
+    pub subnet_mask: u8,
+    /// Next IP to allocate (for sequential allocation)
+    pub next_ip: Ipv4Addr,
+    /// List of configured peers
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+}
+
+impl PeersConfig {
+    /// Create a new peers config with default /24 subnet
+    pub fn new_default() -> Self {
+        Self {
+            subnet: "10.10.10.0".to_string(),
+            subnet_mask: 24,
+            next_ip: Ipv4Addr::new(10, 10, 10, 2),
+            peers: Vec::new(),
+        }
+    }
+
+    /// Create a new peers config with custom subnet
+    pub fn new(subnet: String, subnet_mask: u8) -> Self {
+        // Parse subnet and calculate first client IP (.2)
+        let network: Ipv4Addr = subnet.parse().unwrap_or(Ipv4Addr::new(10, 10, 10, 0));
+        let octets = network.octets();
+        let next_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], 2);
+
+        Self {
+            subnet,
+            subnet_mask,
+            next_ip,
+            peers: Vec::new(),
+        }
+    }
+
+    /// Find a peer by name
+    pub fn find_by_name(&self, name: &str) -> Option<&PeerConfig> {
+        self.peers.iter().find(|p| p.name == name)
+    }
+
+    /// Find a peer by public key
+    pub fn find_by_public_key(&self, public_key: &str) -> Option<&PeerConfig> {
+        self.peers.iter().find(|p| p.public_key == public_key)
+    }
+
+    /// Find a peer by assigned IP
+    pub fn find_by_ip(&self, ip: Ipv4Addr) -> Option<&PeerConfig> {
+        self.peers.iter().find(|p| p.assigned_ip == ip)
+    }
+
+    /// Add a peer
+    pub fn add_peer(&mut self, peer: PeerConfig) {
+        self.peers.push(peer);
+    }
+
+    /// Remove a peer by name, returns the removed peer if found
+    pub fn remove_peer(&mut self, name: &str) -> Option<PeerConfig> {
+        if let Some(pos) = self.peers.iter().position(|p| p.name == name) {
+            Some(self.peers.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Get server address (first IP in subnet, e.g., 10.10.10.1)
+    pub fn server_address(&self) -> Ipv4Addr {
+        let network: Ipv4Addr = self.subnet.parse().unwrap_or(Ipv4Addr::new(10, 10, 10, 0));
+        let octets = network.octets();
+        Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3].saturating_add(1))
+    }
+}
+
+impl Default for PeersConfig {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+// ============================================================================
+// Server Configuration
+// ============================================================================
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

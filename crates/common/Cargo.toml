@@ -26,5 +26,8 @@ socket2.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 log.workspace = true
 
+# Time
+chrono.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }

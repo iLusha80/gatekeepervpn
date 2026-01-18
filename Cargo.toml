@@ -41,3 +41,6 @@ anyhow = "1.0"
 # Network
 tun = { version = "0.8", features = ["async"] }
 socket2 = "0.5"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }

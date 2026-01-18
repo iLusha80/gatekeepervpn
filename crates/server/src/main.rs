@@ -1,7 +1,15 @@
+//! GatekeeperVPN Server
+//!
+//! VPN server with:
+//! - Per-client authorization via peers.toml
+//! - Unicast routing based on destination IP
+//! - Hot-reload of peers configuration
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -9,12 +17,19 @@ use clap::Parser;
 use tokio::net::UdpSocket;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tokio::time::interval;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    Error as CommonError, Packet, PacketType, Responder, ServerConfig, Transport, TunConfig,
-    TunDevice, VpnErrorLoggers, configure_socket, print_nat_instructions,
+    Error as CommonError, Packet, PacketType, PeersConfig, Responder, ServerConfig, Transport,
+    TunConfig, TunDevice, VpnErrorLoggers, configure_socket, get_destination_ip,
+    print_nat_instructions,
 };
+
+/// Default peers file location
+const DEFAULT_PEERS_FILE: &str = "/etc/gatekeeper/peers.toml";
+/// Interval for checking peers.toml changes
+const PEERS_RELOAD_INTERVAL_SECS: u64 = 5;
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-server")]
@@ -24,6 +39,10 @@ struct Args {
     #[arg(short, long, default_value = "server.toml")]
     config: String,
 
+    /// Path to peers file
+    #[arg(short, long, default_value = DEFAULT_PEERS_FILE)]
+    peers: String,
+
     /// Listen address (overrides config)
     #[arg(short, long)]
     listen: Option<String>,
@@ -31,25 +50,109 @@ struct Args {
     /// Echo mode: don't create TUN, just echo packets back
     #[arg(short, long)]
     echo: bool,
+
+    /// Disable peer authorization (allow any client)
+    #[arg(long)]
+    no_auth: bool,
 }
 
-/// Client session state (transport ready after handshake)
-type ClientState = Transport;
+/// Connected client session
+#[allow(dead_code)]
+struct ConnectedClient {
+    /// Transport state for encryption/decryption
+    transport: Transport,
+    /// Client's public key (for future use: key rotation, audit logs)
+    public_key: [u8; 32],
+    /// Assigned VPN IP address (stored for reference, routing uses ip_to_addr map)
+    assigned_ip: Ipv4Addr,
+    /// Client name from peers.toml
+    name: String,
+    /// Last activity timestamp
+    last_activity: Instant,
+}
+
+/// Authorized peer info (from peers.toml)
+#[derive(Clone)]
+struct AuthorizedPeer {
+    name: String,
+    public_key: [u8; 32],
+    assigned_ip: Ipv4Addr,
+}
 
 /// Server state
 struct Server {
     /// Server's private key
     private_key: Vec<u8>,
-    /// Connected clients
-    clients: HashMap<SocketAddr, ClientState>,
+    /// Connected clients by socket address
+    clients_by_addr: HashMap<SocketAddr, ConnectedClient>,
+    /// Map VPN IP -> socket address (for unicast routing)
+    ip_to_addr: HashMap<Ipv4Addr, SocketAddr>,
+    /// Authorized peers (white list from peers.toml)
+    authorized_peers: HashMap<[u8; 32], AuthorizedPeer>,
+    /// Authorization enabled
+    auth_enabled: bool,
 }
 
 impl Server {
-    fn new(private_key: Vec<u8>) -> Self {
+    fn new(private_key: Vec<u8>, auth_enabled: bool) -> Self {
         Self {
             private_key,
-            clients: HashMap::new(),
+            clients_by_addr: HashMap::new(),
+            ip_to_addr: HashMap::new(),
+            authorized_peers: HashMap::new(),
+            auth_enabled,
         }
+    }
+
+    /// Load authorized peers from PeersConfig
+    fn load_peers(&mut self, peers_config: &PeersConfig) {
+        self.authorized_peers.clear();
+
+        for peer in &peers_config.peers {
+            if let Ok(key_bytes) = keys::decode(&peer.public_key) {
+                if key_bytes.len() == 32 {
+                    let mut key_array = [0u8; 32];
+                    key_array.copy_from_slice(&key_bytes);
+
+                    self.authorized_peers.insert(
+                        key_array,
+                        AuthorizedPeer {
+                            name: peer.name.clone(),
+                            public_key: key_array,
+                            assigned_ip: peer.assigned_ip,
+                        },
+                    );
+                }
+            }
+        }
+
+        log::info!(
+            "Loaded {} authorized peer(s) from peers.toml",
+            self.authorized_peers.len()
+        );
+    }
+
+    /// Reload peers (hot-reload)
+    fn reload_peers(&mut self, peers_config: &PeersConfig) {
+        let old_count = self.authorized_peers.len();
+        self.load_peers(peers_config);
+        let new_count = self.authorized_peers.len();
+
+        if new_count != old_count {
+            log::info!(
+                "Peers reloaded: {} -> {} authorized peer(s)",
+                old_count,
+                new_count
+            );
+        }
+    }
+
+    /// Check if a public key is authorized
+    fn is_authorized(&self, public_key: &[u8; 32]) -> Option<&AuthorizedPeer> {
+        if !self.auth_enabled {
+            return None; // Auth disabled, return None but allow
+        }
+        self.authorized_peers.get(public_key)
     }
 
     /// Handle handshake init from a client
@@ -57,7 +160,7 @@ impl Server {
         &mut self,
         addr: SocketAddr,
         payload: &[u8],
-    ) -> Result<(Packet, Transport)> {
+    ) -> Result<(Packet, Transport, Option<AuthorizedPeer>)> {
         log::info!("[{}] Handshake init received", addr);
 
         // Create new responder for this client
@@ -69,22 +172,107 @@ impl Server {
             .read_message(payload)
             .context("Failed to read handshake init")?;
 
+        // Get client's public key
+        let remote_key = responder
+            .get_remote_static()
+            .context("Failed to get remote public key")?;
+
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(remote_key);
+
+        log::info!("[{}] Client public key: {}", addr, keys::encode(&key_array));
+
+        // Check authorization
+        let authorized_peer = if self.auth_enabled {
+            match self.is_authorized(&key_array) {
+                Some(peer) => {
+                    log::info!(
+                        "[{}] Client '{}' authorized (IP: {})",
+                        addr,
+                        peer.name,
+                        peer.assigned_ip
+                    );
+                    Some(peer.clone())
+                }
+                None => {
+                    log::warn!("[{}] Unauthorized client, rejecting", addr);
+                    anyhow::bail!("Client not authorized");
+                }
+            }
+        } else {
+            log::info!("[{}] Authorization disabled, allowing connection", addr);
+            None
+        };
+
         // Generate response
         let response = responder
             .write_message(&[])
             .context("Failed to write handshake response")?;
 
         log::info!("[{}] Handshake complete", addr);
-        if let Some(remote_key) = responder.get_remote_static() {
-            log::info!("[{}] Client public key: {}", addr, keys::encode(remote_key));
-        }
 
         // Convert to transport mode
         let transport = responder
             .into_transport()
             .context("Failed to enter transport mode")?;
 
-        Ok((Packet::handshake_response(response), transport))
+        Ok((
+            Packet::handshake_response(response),
+            transport,
+            authorized_peer,
+        ))
+    }
+
+    /// Register a connected client
+    fn register_client(
+        &mut self,
+        addr: SocketAddr,
+        transport: Transport,
+        public_key: [u8; 32],
+        peer: Option<AuthorizedPeer>,
+    ) {
+        let (name, assigned_ip) = if let Some(p) = peer {
+            (p.name, p.assigned_ip)
+        } else {
+            // For unauthorized mode, assign a temporary name and IP
+            let name = format!("unknown-{}", addr.port());
+            let assigned_ip = Ipv4Addr::new(0, 0, 0, 0);
+            (name, assigned_ip)
+        };
+
+        // Remove any existing mapping for this IP
+        if assigned_ip != Ipv4Addr::new(0, 0, 0, 0) {
+            self.ip_to_addr.insert(assigned_ip, addr);
+        }
+
+        let client = ConnectedClient {
+            transport,
+            public_key,
+            assigned_ip,
+            name,
+            last_activity: Instant::now(),
+        };
+
+        self.clients_by_addr.insert(addr, client);
+    }
+
+    /// Remove a disconnected client (for future use: timeout handling)
+    #[allow(dead_code)]
+    fn remove_client(&mut self, addr: &SocketAddr) {
+        if let Some(client) = self.clients_by_addr.remove(addr) {
+            self.ip_to_addr.remove(&client.assigned_ip);
+            log::info!(
+                "[{}] Client '{}' disconnected (IP: {})",
+                addr,
+                client.name,
+                client.assigned_ip
+            );
+        }
+    }
+
+    /// Get socket address for a VPN IP (unicast routing)
+    fn get_addr_for_ip(&self, ip: Ipv4Addr) -> Option<SocketAddr> {
+        self.ip_to_addr.get(&ip).copied()
     }
 }
 
@@ -97,6 +285,25 @@ fn load_config(path: &str) -> Result<ServerConfig> {
         log::warn!("Config file not found: {}, using defaults", path);
         Ok(ServerConfig::default())
     }
+}
+
+fn load_peers_config(path: &Path) -> Result<PeersConfig> {
+    if path.exists() {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read peers file: {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse peers file: {}", path.display()))
+    } else {
+        log::warn!(
+            "Peers file not found: {}, authorization disabled",
+            path.display()
+        );
+        Ok(PeersConfig::default())
+    }
+}
+
+fn get_file_modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 /// Echo mode: just echo back decrypted data
@@ -129,8 +336,12 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
 
             match packet.packet_type {
                 PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
-                    Ok((response, transport)) => {
-                        server.clients.insert(addr, transport);
+                    Ok((response, transport, peer)) => {
+                        let mut key_array = [0u8; 32];
+                        if let Some(ref p) = peer {
+                            key_array = p.public_key;
+                        }
+                        server.register_client(addr, transport, key_array, peer);
                         Some(response)
                     }
                     Err(e) => {
@@ -143,9 +354,10 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                     None
                 }
                 PacketType::Data => {
-                    match server.clients.get_mut(&addr) {
-                        Some(transport) => {
-                            match transport.decrypt(&packet.payload) {
+                    match server.clients_by_addr.get_mut(&addr) {
+                        Some(client) => {
+                            client.last_activity = Instant::now();
+                            match client.transport.decrypt(&packet.payload) {
                                 Ok(plaintext) => {
                                     log::info!(
                                         "[{}] Received: {} ({} bytes)",
@@ -157,7 +369,7 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                     // Echo back
                                     let response_data =
                                         format!("Echo: {}", String::from_utf8_lossy(&plaintext));
-                                    match transport.encrypt(response_data.as_bytes()) {
+                                    match client.transport.encrypt(response_data.as_bytes()) {
                                         Ok(encrypted) => Some(Packet::data(encrypted)),
                                         Err(e) => {
                                             log::error!("[{}] Encrypt error: {}", addr, e);
@@ -166,7 +378,6 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                     }
                                 }
                                 Err(e) => {
-                                    // Differentiate between replay and crypto errors
                                     if matches!(e, CommonError::ReplayedPacket) {
                                         error_loggers.decrypt_replay.debug(&format!(
                                             "[{}] Replayed/out-of-order packet dropped",
@@ -188,7 +399,10 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                     }
                 }
                 PacketType::KeepAlive => {
-                    if server.clients.contains_key(&addr) {
+                    if server.clients_by_addr.contains_key(&addr) {
+                        if let Some(client) = server.clients_by_addr.get_mut(&addr) {
+                            client.last_activity = Instant::now();
+                        }
                         log::debug!("[{}] KeepAlive received", addr);
                         Some(Packet::keep_alive_ack())
                     } else {
@@ -211,11 +425,12 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
     }
 }
 
-/// VPN mode: forward traffic between UDP and TUN
+/// VPN mode: forward traffic between UDP and TUN with unicast routing
 async fn run_vpn_mode(
     socket: Arc<UdpSocket>,
     server: Arc<Mutex<Server>>,
     config: &ServerConfig,
+    peers_path: PathBuf,
 ) -> Result<()> {
     // Parse TUN config
     let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
@@ -236,7 +451,6 @@ async fn run_vpn_mode(
     log::info!("VPN server TUN interface: {}", tun_device.name());
 
     // Print NAT setup instructions
-    // Simplified: assume /24 subnet based on server address (e.g., 10.0.0.1 -> 10.0.0.0/24)
     let subnet = config
         .tun_address
         .rsplitn(2, '.')
@@ -254,9 +468,38 @@ async fn run_vpn_mode(
     let socket_tx = socket.clone();
     let socket_rx = socket;
     let server_tx = server.clone();
-    let server_rx = server;
+    let server_rx = server.clone();
+    let server_reload = server;
     let loggers_rx = error_loggers.clone();
     let loggers_tx = error_loggers;
+
+    // Task 0: Hot-reload peers.toml
+    let peers_watcher = tokio::spawn(async move {
+        let mut last_modified = get_file_modified_time(&peers_path);
+        let mut check_interval = interval(Duration::from_secs(PEERS_RELOAD_INTERVAL_SECS));
+
+        loop {
+            check_interval.tick().await;
+
+            let current_modified = get_file_modified_time(&peers_path);
+
+            if current_modified != last_modified {
+                log::info!("peers.toml changed, reloading...");
+
+                match load_peers_config(&peers_path) {
+                    Ok(new_peers) => {
+                        let mut server = server_reload.lock().await;
+                        server.reload_peers(&new_peers);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to reload peers.toml: {}", e);
+                    }
+                }
+
+                last_modified = current_modified;
+            }
+        }
+    });
 
     // Task 1: UDP -> TUN (incoming from clients)
     let udp_to_tun = tokio::spawn(async move {
@@ -284,8 +527,12 @@ async fn run_vpn_mode(
 
             match packet.packet_type {
                 PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
-                    Ok((response, transport)) => {
-                        server.clients.insert(addr, transport);
+                    Ok((response, transport, peer)) => {
+                        let mut key_array = [0u8; 32];
+                        if let Some(ref p) = peer {
+                            key_array = p.public_key;
+                        }
+                        server.register_client(addr, transport, key_array, peer);
                         if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
                             log::error!("[{}] Failed to send handshake response: {}", addr, e);
                         }
@@ -298,10 +545,16 @@ async fn run_vpn_mode(
                     log::warn!("[{}] Unexpected handshake response", addr);
                 }
                 PacketType::Data => {
-                    if let Some(transport) = server.clients.get_mut(&addr) {
-                        match transport.decrypt(&packet.payload) {
+                    if let Some(client) = server.clients_by_addr.get_mut(&addr) {
+                        client.last_activity = Instant::now();
+                        match client.transport.decrypt(&packet.payload) {
                             Ok(plaintext) => {
-                                log::debug!("[{}] UDP -> TUN: {} bytes", addr, plaintext.len());
+                                log::debug!(
+                                    "[{}] {} UDP -> TUN: {} bytes",
+                                    addr,
+                                    client.name,
+                                    plaintext.len()
+                                );
                                 if let Err(e) = tun_writer.write(&plaintext).await {
                                     loggers_rx
                                         .tun_write
@@ -309,7 +562,6 @@ async fn run_vpn_mode(
                                 }
                             }
                             Err(e) => {
-                                // Differentiate between replay and crypto errors
                                 if matches!(e, CommonError::ReplayedPacket) {
                                     loggers_rx.decrypt_replay.debug(&format!(
                                         "[{}] Replayed/out-of-order packet dropped",
@@ -327,8 +579,9 @@ async fn run_vpn_mode(
                     }
                 }
                 PacketType::KeepAlive => {
-                    if server.clients.contains_key(&addr) {
-                        log::debug!("[{}] KeepAlive received", addr);
+                    if let Some(client) = server.clients_by_addr.get_mut(&addr) {
+                        client.last_activity = Instant::now();
+                        log::debug!("[{}] {} KeepAlive received", addr, client.name);
                         let response = Packet::keep_alive_ack();
                         if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
                             log::error!("[{}] Failed to send KeepAliveAck: {}", addr, e);
@@ -344,9 +597,7 @@ async fn run_vpn_mode(
         }
     });
 
-    // Task 2: TUN -> UDP (outgoing to clients)
-    // Note: Simple implementation sends to first connected client
-    // A real VPN would parse IP headers to determine destination
+    // Task 2: TUN -> UDP (outgoing to clients) with UNICAST routing
     let tun_to_udp = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
 
@@ -360,32 +611,29 @@ async fn run_vpn_mode(
                 }
             };
 
-            let server = server_tx.lock().await;
+            // Parse destination IP from packet for unicast routing
+            let dst_ip = match get_destination_ip(&buf[..n]) {
+                Ok(ip) => ip,
+                Err(_) => {
+                    log::debug!("Failed to parse destination IP, skipping packet");
+                    continue;
+                }
+            };
 
-            // Send to all connected clients (broadcast for simplicity)
-            // A real VPN would route based on IP destination
-            for (addr, _transport) in server.clients.iter() {
-                // Note: We need mutable access to transport for encryption
-                // This is a simplified version - real impl would use separate
-                // encryption state or lock per client
-                log::debug!("TUN -> UDP [{}]: {} bytes", addr, n);
-            }
-            drop(server);
-
-            // For now, we need a different approach for TUN -> UDP
-            // because we need mutable access to transport
             let mut server = server_tx.lock().await;
-            let client_addrs: Vec<_> = server.clients.keys().copied().collect();
 
-            for addr in client_addrs {
-                if let Some(transport) = server.clients.get_mut(&addr) {
-                    match transport.encrypt(&buf[..n]) {
+            // Unicast: find the specific client for this destination IP
+            if let Some(addr) = server.get_addr_for_ip(dst_ip) {
+                if let Some(client) = server.clients_by_addr.get_mut(&addr) {
+                    match client.transport.encrypt(&buf[..n]) {
                         Ok(encrypted) => {
                             let packet = Packet::data(encrypted);
                             if let Err(e) = socket_tx.send_to(&packet.encode(), addr).await {
                                 loggers_tx
                                     .udp_send
                                     .warn(&format!("[{}] UDP send error: {}", addr, e));
+                            } else {
+                                log::debug!("TUN -> UDP [{}] {}: {} bytes", addr, client.name, n);
                             }
                         }
                         Err(e) => {
@@ -393,6 +641,9 @@ async fn run_vpn_mode(
                         }
                     }
                 }
+            } else {
+                // Destination IP not found - could be a broadcast or unknown destination
+                log::debug!("No route for destination IP: {}", dst_ip);
             }
         }
     });
@@ -400,6 +651,7 @@ async fn run_vpn_mode(
     tokio::select! {
         _ = udp_to_tun => log::error!("UDP->TUN task finished unexpectedly"),
         _ = tun_to_udp => log::error!("TUN->UDP task finished unexpectedly"),
+        _ = peers_watcher => log::error!("Peers watcher task finished unexpectedly"),
         _ = signal::ctrl_c() => {
             log::info!("Received shutdown signal (Ctrl+C)");
             log::info!("Server shutting down...");
@@ -434,6 +686,28 @@ async fn main() -> Result<()> {
 
     let private_key = keys::decode(&config.private_key).context("Invalid private key format")?;
 
+    // Create server with authorization
+    let auth_enabled = !args.no_auth;
+    let server = Arc::new(Mutex::new(Server::new(private_key, auth_enabled)));
+
+    // Load peers configuration
+    let peers_path = PathBuf::from(&args.peers);
+    if auth_enabled {
+        match load_peers_config(&peers_path) {
+            Ok(peers_config) => {
+                let mut srv = server.lock().await;
+                srv.load_peers(&peers_config);
+            }
+            Err(e) => {
+                log::warn!("Failed to load peers.toml: {}. Authorization disabled.", e);
+                let mut srv = server.lock().await;
+                srv.auth_enabled = false;
+            }
+        }
+    } else {
+        log::warn!("Authorization disabled (--no-auth flag)");
+    }
+
     // Create UDP socket
     let socket = UdpSocket::bind(&config.listen)
         .await
@@ -447,13 +721,12 @@ async fn main() -> Result<()> {
     log::info!("GatekeeperVPN server listening on {}", config.listen);
 
     let socket = Arc::new(socket);
-    let server = Arc::new(Mutex::new(Server::new(private_key)));
 
     if args.echo {
         log::info!("Running in ECHO mode (no TUN)");
         run_echo_mode(socket, server).await
     } else {
         log::info!("Running in VPN mode");
-        run_vpn_mode(socket, server, &config).await
+        run_vpn_mode(socket, server, &config, peers_path).await
     }
 }
