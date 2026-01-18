@@ -12,7 +12,7 @@ use crate::Error;
 /// Noise protocol pattern: IK
 /// - I: Initiator sends their static key
 /// - K: Responder's static key is known to initiator
-const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// Generate a new X25519 keypair
 pub fn generate_keypair() -> Result<Keypair, Error> {
