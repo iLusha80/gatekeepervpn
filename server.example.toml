@@ -1,0 +1,8 @@
+# GatekeeperVPN Server Configuration
+
+# Listen address
+listen = "0.0.0.0:51820"
+
+# Server's private key (base64 encoded)
+# Generate with: cargo run --bin gatekeeper-server (will print a new keypair)
+private_key = ""

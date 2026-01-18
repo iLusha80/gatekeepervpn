@@ -13,4 +13,10 @@ pub enum Error {
 
     #[error("handshake not completed")]
     HandshakeNotCompleted,
+
+    #[error("invalid key format")]
+    InvalidKey,
+
+    #[error("config error: {0}")]
+    Config(String),
 }

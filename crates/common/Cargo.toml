@@ -12,6 +12,11 @@ rand.workspace = true
 # Serialization
 serde.workspace = true
 bytes.workspace = true
+base64.workspace = true
+toml.workspace = true
 
 # Errors
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
