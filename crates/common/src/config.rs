@@ -139,7 +139,7 @@ impl Default for ClientConfig {
 
 /// Base64 encoding/decoding utilities for keys
 pub mod keys {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     use crate::Error;
 

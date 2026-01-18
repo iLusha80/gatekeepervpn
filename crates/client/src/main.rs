@@ -8,12 +8,15 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
-use tokio::time::{timeout, interval};
 use tokio::signal;
+use tokio::sync::Mutex;
+use tokio::time::{interval, timeout};
 
 use gatekeeper_common::config::keys;
-use gatekeeper_common::{ClientConfig, Initiator, Packet, PacketType, RouteConfig, Transport, TunConfig, TunDevice, cleanup_routes, setup_routes};
+use gatekeeper_common::{
+    ClientConfig, Initiator, Packet, PacketType, RouteConfig, Transport, TunConfig, TunDevice,
+    cleanup_routes, setup_routes,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-client")]
@@ -42,8 +45,7 @@ fn load_config(path: &str) -> Result<ClientConfig> {
     if Path::new(path).exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path))
+        toml::from_str(&content).with_context(|| format!("Failed to parse config file: {}", path))
     } else {
         log::warn!("Config file not found: {}, using defaults", path);
         Ok(ClientConfig::default())
@@ -69,15 +71,18 @@ async fn perform_handshake(
 ) -> Result<Transport> {
     log::info!("Starting handshake...");
 
-    let mut initiator = Initiator::new(private_key, server_public_key)
-        .context("Failed to create initiator")?;
+    let mut initiator =
+        Initiator::new(private_key, server_public_key).context("Failed to create initiator")?;
 
     // Send handshake init
-    let init_msg = initiator.write_message(&[])
+    let init_msg = initiator
+        .write_message(&[])
         .context("Failed to create handshake init")?;
     let init_packet = Packet::handshake_init(init_msg);
 
-    socket.send(&init_packet.encode()).await
+    socket
+        .send(&init_packet.encode())
+        .await
         .context("Failed to send handshake init")?;
 
     // Receive handshake response
@@ -86,11 +91,15 @@ async fn perform_handshake(
         .context("Failed to receive handshake response")?;
 
     if response_packet.packet_type != PacketType::HandshakeResponse {
-        anyhow::bail!("Expected HandshakeResponse, got {:?}", response_packet.packet_type);
+        anyhow::bail!(
+            "Expected HandshakeResponse, got {:?}",
+            response_packet.packet_type
+        );
     }
 
     // Process response
-    initiator.read_message(&response_packet.payload)
+    initiator
+        .read_message(&response_packet.payload)
         .context("Failed to process handshake response")?;
 
     if !initiator.is_finished() {
@@ -99,23 +108,23 @@ async fn perform_handshake(
 
     log::info!("Handshake complete!");
 
-    initiator.into_transport()
+    initiator
+        .into_transport()
         .context("Failed to enter transport mode")
 }
 
 /// Test mode: send a message and receive echo
-async fn run_test_mode(
-    socket: &UdpSocket,
-    transport: &mut Transport,
-    message: &str,
-) -> Result<()> {
+async fn run_test_mode(socket: &UdpSocket, transport: &mut Transport, message: &str) -> Result<()> {
     log::info!("Test mode: sending message: {}", message);
 
-    let encrypted = transport.encrypt(message.as_bytes())
+    let encrypted = transport
+        .encrypt(message.as_bytes())
         .context("Failed to encrypt message")?;
     let data_packet = Packet::data(encrypted);
 
-    socket.send(&data_packet.encode()).await
+    socket
+        .send(&data_packet.encode())
+        .await
         .context("Failed to send data")?;
 
     // Receive echo response
@@ -127,7 +136,8 @@ async fn run_test_mode(
         anyhow::bail!("Expected Data packet, got {:?}", echo_packet.packet_type);
     }
 
-    let decrypted = transport.decrypt(&echo_packet.payload)
+    let decrypted = transport
+        .decrypt(&echo_packet.payload)
         .context("Failed to decrypt response")?;
 
     log::info!("Received: {}", String::from_utf8_lossy(&decrypted));
@@ -171,10 +181,8 @@ async fn run_vpn_mode(
     config: &ClientConfig,
 ) -> Result<()> {
     // Parse TUN config
-    let tun_address: Ipv4Addr = config.tun_address.parse()
-        .context("Invalid TUN address")?;
-    let tun_netmask: Ipv4Addr = config.tun_netmask.parse()
-        .context("Invalid TUN netmask")?;
+    let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
+    let tun_netmask: Ipv4Addr = config.tun_netmask.parse().context("Invalid TUN netmask")?;
 
     let tun_config = TunConfig {
         name: None,
@@ -184,13 +192,15 @@ async fn run_vpn_mode(
     };
 
     // Create TUN device (requires root)
-    let tun_device = TunDevice::create(tun_config).await
+    let tun_device = TunDevice::create(tun_config)
+        .await
         .context("Failed to create TUN device. Are you running as root?")?;
 
     log::info!("VPN tunnel established on {}", tun_device.name());
 
     // Setup routes if configured
-    let server_ip: Ipv4Addr = config.server
+    let server_ip: Ipv4Addr = config
+        .server
         .split(':')
         .next()
         .and_then(|s| s.parse().ok())
@@ -329,7 +339,11 @@ async fn run_vpn_mode(
             return;
         }
 
-        log::info!("Keep-alive enabled: interval={}s, timeout={}s", keepalive_interval, keepalive_timeout);
+        log::info!(
+            "Keep-alive enabled: interval={}s, timeout={}s",
+            keepalive_interval,
+            keepalive_timeout
+        );
 
         let mut ticker = interval(Duration::from_secs(keepalive_interval));
 
@@ -384,7 +398,9 @@ async fn run_vpn_connection(
 ) -> Result<()> {
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(&config.server).await
+    socket
+        .connect(&config.server)
+        .await
         .with_context(|| format!("Failed to connect to {}", config.server))?;
 
     log::info!("Connecting to server: {}", config.server);
@@ -424,15 +440,16 @@ async fn main() -> Result<()> {
         anyhow::bail!("Server public key is required. Set 'server_public_key' in config.");
     }
 
-    let private_key = keys::decode(&config.private_key)
-        .context("Invalid private key format")?;
-    let server_public_key = keys::decode(&config.server_public_key)
-        .context("Invalid server public key format")?;
+    let private_key = keys::decode(&config.private_key).context("Invalid private key format")?;
+    let server_public_key =
+        keys::decode(&config.server_public_key).context("Invalid server public key format")?;
 
     if args.test {
         // Test mode - single connection, no reconnect
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(&config.server).await
+        socket
+            .connect(&config.server)
+            .await
             .with_context(|| format!("Failed to connect to {}", config.server))?;
 
         log::info!("Connecting to server: {}", config.server);
@@ -447,14 +464,22 @@ async fn main() -> Result<()> {
             attempt += 1;
 
             if config.max_reconnect_attempts > 0 && attempt > config.max_reconnect_attempts {
-                log::error!("Max reconnect attempts ({}) reached, giving up", config.max_reconnect_attempts);
+                log::error!(
+                    "Max reconnect attempts ({}) reached, giving up",
+                    config.max_reconnect_attempts
+                );
                 break;
             }
 
             if attempt > 1 {
-                log::info!("Reconnection attempt {} (max: {})",
+                log::info!(
+                    "Reconnection attempt {} (max: {})",
                     attempt,
-                    if config.max_reconnect_attempts == 0 { "unlimited".to_string() } else { config.max_reconnect_attempts.to_string() }
+                    if config.max_reconnect_attempts == 0 {
+                        "unlimited".to_string()
+                    } else {
+                        config.max_reconnect_attempts.to_string()
+                    }
                 );
             }
 
@@ -471,7 +496,10 @@ async fn main() -> Result<()> {
                         return Err(e);
                     }
 
-                    log::info!("Waiting {} seconds before reconnecting...", config.reconnect_delay);
+                    log::info!(
+                        "Waiting {} seconds before reconnecting...",
+                        config.reconnect_delay
+                    );
                     tokio::time::sleep(Duration::from_secs(config.reconnect_delay)).await;
                 }
             }

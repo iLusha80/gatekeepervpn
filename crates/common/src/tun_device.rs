@@ -83,10 +83,10 @@ impl TunDevice {
             tun_config.name(name);
         }
 
-        let device = tun::create_as_async(&tun_config)
-            .map_err(|e| Error::Tun(e.to_string()))?;
+        let device = tun::create_as_async(&tun_config).map_err(|e| Error::Tun(e.to_string()))?;
 
-        let name = device.tun_name()
+        let name = device
+            .tun_name()
             .map_err(|e: tun::Error| Error::Tun(e.to_string()))?;
 
         log::info!("Created TUN device: {}", name);

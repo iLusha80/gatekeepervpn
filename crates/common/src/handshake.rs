@@ -6,8 +6,8 @@
 
 use snow::{Builder, HandshakeState, TransportState};
 
-use crate::crypto::NOISE_PATTERN;
 use crate::Error;
+use crate::crypto::NOISE_PATTERN;
 
 /// Maximum size for handshake messages
 pub const MAX_HANDSHAKE_MSG_SIZE: usize = 256;
@@ -175,8 +175,7 @@ mod tests {
         let server_keys = generate_keypair().unwrap();
 
         // Create initiator (client) with server's public key
-        let mut initiator =
-            Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
 
         // Create responder (server)
         let mut responder = Responder::new(&server_keys.private).unwrap();
@@ -210,8 +209,7 @@ mod tests {
         let client_keys = generate_keypair().unwrap();
         let server_keys = generate_keypair().unwrap();
 
-        let mut initiator =
-            Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
         let mut responder = Responder::new(&server_keys.private).unwrap();
 
         // Complete handshake
@@ -242,8 +240,7 @@ mod tests {
         let client_keys = generate_keypair().unwrap();
         let server_keys = generate_keypair().unwrap();
 
-        let initiator =
-            Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
 
         // Try to convert to transport before handshake is complete
         let result = initiator.into_transport();

@@ -7,11 +7,14 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tokio::signal;
+use tokio::sync::Mutex;
 
 use gatekeeper_common::config::keys;
-use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice, print_nat_instructions};
+use gatekeeper_common::{
+    Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice,
+    print_nat_instructions,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-server")]
@@ -50,12 +53,16 @@ impl Server {
     }
 
     /// Handle handshake init from a client
-    fn handle_handshake(&mut self, addr: SocketAddr, payload: &[u8]) -> Result<(Packet, Transport)> {
+    fn handle_handshake(
+        &mut self,
+        addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(Packet, Transport)> {
         log::info!("[{}] Handshake init received", addr);
 
         // Create new responder for this client
-        let mut responder = Responder::new(&self.private_key)
-            .context("Failed to create responder")?;
+        let mut responder =
+            Responder::new(&self.private_key).context("Failed to create responder")?;
 
         // Process handshake init message
         responder
@@ -85,8 +92,7 @@ fn load_config(path: &str) -> Result<ServerConfig> {
     if Path::new(path).exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path))
+        toml::from_str(&content).with_context(|| format!("Failed to parse config file: {}", path))
     } else {
         log::warn!("Config file not found: {}, using defaults", path);
         Ok(ServerConfig::default())
@@ -94,10 +100,7 @@ fn load_config(path: &str) -> Result<ServerConfig> {
 }
 
 /// Echo mode: just echo back decrypted data
-async fn run_echo_mode(
-    socket: Arc<UdpSocket>,
-    server: Arc<Mutex<Server>>,
-) -> Result<()> {
+async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Result<()> {
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -124,18 +127,16 @@ async fn run_echo_mode(
             let mut server = server.lock().await;
 
             match packet.packet_type {
-                PacketType::HandshakeInit => {
-                    match server.handle_handshake(addr, &packet.payload) {
-                        Ok((response, transport)) => {
-                            server.clients.insert(addr, transport);
-                            Some(response)
-                        }
-                        Err(e) => {
-                            log::error!("[{}] Handshake error: {}", addr, e);
-                            None
-                        }
+                PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
+                    Ok((response, transport)) => {
+                        server.clients.insert(addr, transport);
+                        Some(response)
                     }
-                }
+                    Err(e) => {
+                        log::error!("[{}] Handshake error: {}", addr, e);
+                        None
+                    }
+                },
                 PacketType::HandshakeResponse => {
                     log::warn!("[{}] Unexpected handshake response", addr);
                     None
@@ -153,7 +154,8 @@ async fn run_echo_mode(
                                     );
 
                                     // Echo back
-                                    let response_data = format!("Echo: {}", String::from_utf8_lossy(&plaintext));
+                                    let response_data =
+                                        format!("Echo: {}", String::from_utf8_lossy(&plaintext));
                                     match transport.encrypt(response_data.as_bytes()) {
                                         Ok(encrypted) => Some(Packet::data(encrypted)),
                                         Err(e) => {
@@ -205,10 +207,8 @@ async fn run_vpn_mode(
     config: &ServerConfig,
 ) -> Result<()> {
     // Parse TUN config
-    let tun_address: Ipv4Addr = config.tun_address.parse()
-        .context("Invalid TUN address")?;
-    let tun_netmask: Ipv4Addr = config.tun_netmask.parse()
-        .context("Invalid TUN netmask")?;
+    let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
+    let tun_netmask: Ipv4Addr = config.tun_netmask.parse().context("Invalid TUN netmask")?;
 
     let tun_config = TunConfig {
         name: None,
@@ -218,14 +218,20 @@ async fn run_vpn_mode(
     };
 
     // Create TUN device (requires root)
-    let tun_device = TunDevice::create(tun_config).await
+    let tun_device = TunDevice::create(tun_config)
+        .await
         .context("Failed to create TUN device. Are you running as root?")?;
 
     log::info!("VPN server TUN interface: {}", tun_device.name());
 
     // Print NAT setup instructions
     // Simplified: assume /24 subnet based on server address (e.g., 10.0.0.1 -> 10.0.0.0/24)
-    let subnet = config.tun_address.rsplitn(2, '.').skip(1).next().unwrap_or("10.0.0");
+    let subnet = config
+        .tun_address
+        .rsplitn(2, '.')
+        .skip(1)
+        .next()
+        .unwrap_or("10.0.0");
     let vpn_subnet = format!("{}.0/24", subnet);
     print_nat_instructions(tun_device.name(), &vpn_subnet);
 
@@ -261,19 +267,17 @@ async fn run_vpn_mode(
             let mut server = server_rx.lock().await;
 
             match packet.packet_type {
-                PacketType::HandshakeInit => {
-                    match server.handle_handshake(addr, &packet.payload) {
-                        Ok((response, transport)) => {
-                            server.clients.insert(addr, transport);
-                            if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
-                                log::error!("[{}] Failed to send handshake response: {}", addr, e);
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("[{}] Handshake error: {}", addr, e);
+                PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
+                    Ok((response, transport)) => {
+                        server.clients.insert(addr, transport);
+                        if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
+                            log::error!("[{}] Failed to send handshake response: {}", addr, e);
                         }
                     }
-                }
+                    Err(e) => {
+                        log::error!("[{}] Handshake error: {}", addr, e);
+                    }
+                },
                 PacketType::HandshakeResponse => {
                     log::warn!("[{}] Unexpected handshake response", addr);
                 }
@@ -398,8 +402,7 @@ async fn main() -> Result<()> {
         log::info!("(Save this in client config as server_public_key)");
     }
 
-    let private_key = keys::decode(&config.private_key)
-        .context("Invalid private key format")?;
+    let private_key = keys::decode(&config.private_key).context("Invalid private key format")?;
 
     // Create UDP socket
     let socket = UdpSocket::bind(&config.listen)

@@ -58,11 +58,16 @@ pub fn setup_nat(config: &NatConfig) -> Result<(), Error> {
     // Enable masquerading for VPN traffic
     let status = Command::new("iptables")
         .args([
-            "-t", "nat",
-            "-A", "POSTROUTING",
-            "-s", &config.vpn_subnet,
-            "-o", &config.external_interface,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            &config.vpn_subnet,
+            "-o",
+            &config.external_interface,
+            "-j",
+            "MASQUERADE",
         ])
         .status()
         .map_err(|e| Error::Io(e))?;
@@ -74,33 +79,47 @@ pub fn setup_nat(config: &NatConfig) -> Result<(), Error> {
     // Allow forwarding from TUN to external
     let status = Command::new("iptables")
         .args([
-            "-A", "FORWARD",
-            "-i", &config.tun_interface,
-            "-o", &config.external_interface,
-            "-j", "ACCEPT",
+            "-A",
+            "FORWARD",
+            "-i",
+            &config.tun_interface,
+            "-o",
+            &config.external_interface,
+            "-j",
+            "ACCEPT",
         ])
         .status()
         .map_err(|e| Error::Io(e))?;
 
     if !status.success() {
-        return Err(Error::Route("Failed to add FORWARD rule (TUN -> external)".into()));
+        return Err(Error::Route(
+            "Failed to add FORWARD rule (TUN -> external)".into(),
+        ));
     }
 
     // Allow forwarding from external to TUN (established connections)
     let status = Command::new("iptables")
         .args([
-            "-A", "FORWARD",
-            "-i", &config.external_interface,
-            "-o", &config.tun_interface,
-            "-m", "state",
-            "--state", "RELATED,ESTABLISHED",
-            "-j", "ACCEPT",
+            "-A",
+            "FORWARD",
+            "-i",
+            &config.external_interface,
+            "-o",
+            &config.tun_interface,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
         ])
         .status()
         .map_err(|e| Error::Io(e))?;
 
     if !status.success() {
-        return Err(Error::Route("Failed to add FORWARD rule (external -> TUN)".into()));
+        return Err(Error::Route(
+            "Failed to add FORWARD rule (external -> TUN)".into(),
+        ));
     }
 
     log::info!("NAT configured successfully");
@@ -128,8 +147,7 @@ pass out on {} all
 
     // Write rules to temp file
     let rules_path = "/tmp/gatekeeper_pf.conf";
-    std::fs::write(rules_path, &pf_rules)
-        .map_err(|e| Error::Io(e))?;
+    std::fs::write(rules_path, &pf_rules).map_err(|e| Error::Io(e))?;
 
     // Load rules
     let status = Command::new("pfctl")
@@ -261,9 +279,18 @@ pub fn print_nat_instructions(tun_name: &str, vpn_subnet: &str) {
         println!("   sudo sysctl -w net.ipv4.ip_forward=1");
         println!();
         println!("2. Setup NAT (replace 'eth0' with your external interface):");
-        println!("   sudo iptables -t nat -A POSTROUTING -s {} -o eth0 -j MASQUERADE", vpn_subnet);
-        println!("   sudo iptables -A FORWARD -i {} -o eth0 -j ACCEPT", tun_name);
-        println!("   sudo iptables -A FORWARD -i eth0 -o {} -m state --state RELATED,ESTABLISHED -j ACCEPT", tun_name);
+        println!(
+            "   sudo iptables -t nat -A POSTROUTING -s {} -o eth0 -j MASQUERADE",
+            vpn_subnet
+        );
+        println!(
+            "   sudo iptables -A FORWARD -i {} -o eth0 -j ACCEPT",
+            tun_name
+        );
+        println!(
+            "   sudo iptables -A FORWARD -i eth0 -o {} -m state --state RELATED,ESTABLISHED -j ACCEPT",
+            tun_name
+        );
     }
 
     #[cfg(target_os = "macos")]

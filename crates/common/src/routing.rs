@@ -39,7 +39,9 @@ pub fn get_default_gateway() -> Result<Ipv4Addr, Error> {
         let line = line.trim();
         if line.starts_with("gateway:") {
             let gateway = line.trim_start_matches("gateway:").trim();
-            return gateway.parse().map_err(|_| Error::Route(format!("Invalid gateway: {}", gateway)));
+            return gateway
+                .parse()
+                .map_err(|_| Error::Route(format!("Invalid gateway: {}", gateway)));
         }
     }
 
@@ -75,10 +77,17 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
     log::info!("Original default gateway: {}", original_gateway);
 
     // 1. Add route to VPN server through original gateway
-    log::info!("Adding route to VPN server {} via {}", config.server_ip, original_gateway);
+    log::info!(
+        "Adding route to VPN server {} via {}",
+        config.server_ip,
+        original_gateway
+    );
     let status = Command::new("sudo")
         .args([
-            "route", "-n", "add", "-host",
+            "route",
+            "-n",
+            "add",
+            "-host",
             &config.server_ip.to_string(),
             &original_gateway.to_string(),
         ])
@@ -97,9 +106,13 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
         // Route 0.0.0.0/1 through TUN (covers 0.0.0.0 - 127.255.255.255)
         let status = Command::new("sudo")
             .args([
-                "route", "-n", "add", "-net",
+                "route",
+                "-n",
+                "add",
+                "-net",
                 "0.0.0.0/1",
-                "-interface", &config.tun_name,
+                "-interface",
+                &config.tun_name,
             ])
             .status()
             .map_err(|e| Error::Io(e))?;
@@ -111,9 +124,13 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
         // Route 128.0.0.0/1 through TUN (covers 128.0.0.0 - 255.255.255.255)
         let status = Command::new("sudo")
             .args([
-                "route", "-n", "add", "-net",
+                "route",
+                "-n",
+                "add",
+                "-net",
                 "128.0.0.0/1",
-                "-interface", &config.tun_name,
+                "-interface",
+                &config.tun_name,
             ])
             .status()
             .map_err(|e| Error::Io(e))?;
@@ -127,9 +144,13 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
             log::info!("Adding route for {} through {}", subnet, config.tun_name);
             let status = Command::new("sudo")
                 .args([
-                    "route", "-n", "add", "-net",
+                    "route",
+                    "-n",
+                    "add",
+                    "-net",
                     subnet,
-                    "-interface", &config.tun_name,
+                    "-interface",
+                    &config.tun_name,
                 ])
                 .status()
                 .map_err(|e| Error::Io(e))?;
@@ -150,12 +171,19 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
     log::info!("Original default gateway: {}", original_gateway);
 
     // 1. Add route to VPN server through original gateway
-    log::info!("Adding route to VPN server {} via {}", config.server_ip, original_gateway);
+    log::info!(
+        "Adding route to VPN server {} via {}",
+        config.server_ip,
+        original_gateway
+    );
     let status = Command::new("sudo")
         .args([
-            "ip", "route", "add",
+            "ip",
+            "route",
+            "add",
             &format!("{}/32", config.server_ip),
-            "via", &original_gateway.to_string(),
+            "via",
+            &original_gateway.to_string(),
         ])
         .status()
         .map_err(|e| Error::Io(e))?;
@@ -169,11 +197,7 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
 
         // Route 0.0.0.0/1 through TUN
         let status = Command::new("sudo")
-            .args([
-                "ip", "route", "add",
-                "0.0.0.0/1",
-                "dev", &config.tun_name,
-            ])
+            .args(["ip", "route", "add", "0.0.0.0/1", "dev", &config.tun_name])
             .status()
             .map_err(|e| Error::Io(e))?;
 
@@ -183,11 +207,7 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
 
         // Route 128.0.0.0/1 through TUN
         let status = Command::new("sudo")
-            .args([
-                "ip", "route", "add",
-                "128.0.0.0/1",
-                "dev", &config.tun_name,
-            ])
+            .args(["ip", "route", "add", "128.0.0.0/1", "dev", &config.tun_name])
             .status()
             .map_err(|e| Error::Io(e))?;
 
@@ -198,11 +218,7 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
         for subnet in &config.routed_subnets {
             log::info!("Adding route for {} through {}", subnet, config.tun_name);
             let status = Command::new("sudo")
-                .args([
-                    "ip", "route", "add",
-                    subnet,
-                    "dev", &config.tun_name,
-                ])
+                .args(["ip", "route", "add", subnet, "dev", &config.tun_name])
                 .status()
                 .map_err(|e| Error::Io(e))?;
 
@@ -224,7 +240,10 @@ pub fn cleanup_routes(config: &RouteConfig) -> Result<(), Error> {
     // Remove route to VPN server
     let _ = Command::new("sudo")
         .args([
-            "route", "-n", "delete", "-host",
+            "route",
+            "-n",
+            "delete",
+            "-host",
             &config.server_ip.to_string(),
         ])
         .status();
@@ -256,10 +275,7 @@ pub fn cleanup_routes(config: &RouteConfig) -> Result<(), Error> {
 
     // Remove route to VPN server
     let _ = Command::new("sudo")
-        .args([
-            "ip", "route", "delete",
-            &format!("{}/32", config.server_ip),
-        ])
+        .args(["ip", "route", "delete", &format!("{}/32", config.server_ip)])
         .status();
 
     if config.route_all_traffic {
