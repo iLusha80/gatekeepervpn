@@ -2,9 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+# GatekeeperVPN
+
+GatekeeperVPN — это собственный VPN-протокол и реализация VPN-сервера и клиента на Rust,
+ориентированные на:
+- высокую производительность (по аналогии с WireGuard),
+- простоту архитектуры,
+- устойчивость к блокировкам (DPI, сигнатуры),
+- модульность и расширяемость (desktop и mobile клиенты в будущем).
+
+Проект изначально разрабатывается как закрытый MVP,
+с возможностью последующего open-source релиза.
+
+
+---
+
 ## Rules
 
 * Отвечай **на русском языке строго**
+* Используй всегда актуальные версии библиотек и инструментов (для этого не забывай проверять информацию в mcp context7 ПО необходимости)
 * Always use the `context7` tool to fetch documentation when I ask about specific libraries, APIs, or if you are unsure about the latest syntax
 * Всегда учитывать, что проект собирается и управляется через **cargo**
 * При предложении кода:
@@ -78,7 +94,7 @@ gatekeepervpn/
 
 ## Tech Stack
 
-* **Rust edition 2021**
+* **Rust**
 * **Async**: Tokio
 * **Crypto**: snow, ring
 * **TUN/TAP**: tun-tap (macOS)
