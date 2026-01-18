@@ -2,122 +2,107 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# GatekeeperVPN
-
-GatekeeperVPN — это собственный VPN-протокол и реализация VPN-сервера и клиента на Rust,
-ориентированные на:
-- высокую производительность (по аналогии с WireGuard),
-- простоту архитектуры,
-- устойчивость к блокировкам (DPI, сигнатуры),
-- модульность и расширяемость (desktop и mobile клиенты в будущем).
-
-Проект изначально разрабатывается как закрытый MVP,
-с возможностью последующего open-source релиза.
-
-
----
-
 ## Rules
 
 * Отвечай **на русском языке строго**
-* Используй всегда актуальные версии библиотек и инструментов (для этого не забывай проверять информацию в mcp context7 ПО необходимости)
-* Always use the `context7` tool to fetch documentation when I ask about specific libraries, APIs, or if you are unsure about the latest syntax
-* Всегда учитывать, что проект собирается и управляется через **cargo**
-* При предложении кода:
-  * учитывать тестируемость
-  * учитывать дальнейшую интеграцию в GUI (macOS / iOS)
+* Используй `context7` MCP tool для проверки актуальной документации библиотек
+* При предложении кода учитывать тестируемость и дальнейшую интеграцию в GUI (macOS / iOS)
 
 ---
 
 ## Build & Development Commands
 
 ```bash
-# Сборка
-cargo build              # debug-сборка
-cargo build --release    # release-сборка
+cargo build                          # debug-сборка
+cargo build --release                # release-сборка
+cargo test                           # все тесты
+cargo test --package gatekeeper-common  # тесты common crate
+cargo fmt && cargo clippy            # форматирование + линтер
 
-# Тесты
-cargo test               # запуск всех тестов
-cargo test <test_name>   # запуск одного теста
-cargo test --package <crate_name>  # тесты конкретного crate
+# Запуск (требует root для TUN)
+sudo cargo run --bin server -- -c server.toml
+sudo cargo run --bin client -- -c client.toml
+cargo run --bin server -- --echo     # echo mode без TUN (для тестов)
+cargo run --bin client -- --test     # тест handshake без TUN
 
-# Форматирование и линтинг
-cargo fmt                # форматирование кода
-cargo fmt --check        # проверка форматирования
-cargo clippy             # линтер
-
-# Запуск
-cargo run --bin server   # запуск сервера (после создания)
-cargo run --bin client   # запуск клиента (после создания)
+# Генерация ключей
+cargo run --bin keygen -- generate -o keys/
+cargo run --bin keygen -- show-public -k keys/private.key
 ```
 
 ---
 
-## Project Overview
+## Architecture
 
-GatekeeperVPN — собственный VPN-протокол и реализация на Rust:
-- Высокая производительность (по аналогии с WireGuard)
-- Устойчивость к блокировкам (DPI-resistance)
-- Модульность для будущих desktop/mobile клиентов
+### Модули gatekeeper-common
 
-### Планируемая структура (cargo workspace)
+| Модуль | Назначение |
+|--------|------------|
+| `handshake` | Noise IK protocol: `Initiator`, `Responder`, `Transport` |
+| `protocol` | Бинарный протокол: `Packet`, `PacketType` |
+| `crypto` | Генерация ключей X25519 |
+| `transport` | `StatelessTransportState` + replay protection (SlidingWindow) |
+| `tun_device` | Async TUN интерфейс |
+| `routing` | Настройка системных маршрутов |
+| `socket` | Настройка UDP буферов |
+| `logging` | Rate-limited логирование |
+| `config` | `ClientConfig`, `ServerConfig` (TOML) |
+
+### Поток данных
 
 ```
-gatekeepervpn/
-├── Cargo.toml           # workspace root
-├── crates/
-│   ├── common/          # общие типы, протокол, криптография
-│   ├── server/          # VPN-сервер
-│   ├── client/          # CLI-клиент
-│   └── keygen/          # генерация ключей и конфигов
+Client:  TUN read → encrypt → UDP send → Server
+Server:  UDP recv → decrypt → TUN write → kernel routing → response
 ```
 
-### Компоненты
+### Handshake (Noise IK)
 
-- **Server**: принимает подключения, handshake, шифрование трафика, маршрутизация
-- **Client**: создаёт TUN-интерфейс, перенаправляет трафик через туннель
-- **Keygen**: генерация ключей и клиентских конфигов
+1. Client → Server: `HandshakeInit` (e, es, s, ss)
+2. Server → Client: `HandshakeResponse` (e, ee, se)
+3. Обе стороны переходят в `Transport` mode с session keys
 
 ---
 
 ## Cryptography
 
-* **Key exchange**: Noise Protocol Framework (библиотека `snow`)
-* **Curve**: X25519
-* **Symmetric**: ChaCha20-Poly1305
-* **Hash**: BLAKE2s
-* Session-based keys
+* **Noise pattern**: IK (клиент знает публичный ключ сервера)
+* **Key exchange**: X25519
+* **AEAD**: ChaCha20-Poly1305
+* **Nonce**: 8-byte counter (little-endian) + SlidingWindow для replay protection
 
-Не изобретать собственную криптографию — использовать только `snow`, `ring`.
+Не изобретать криптографию — только `snow`.
 
 ---
 
-## Tech Stack
+## Error Handling
 
-* **Rust**
-* **Async**: Tokio
-* **Crypto**: snow, ring
-* **TUN/TAP**: tun-tap (macOS)
-* **CLI**: clap
-* **Config**: serde + toml
-* **Logging**: log + env_logger
-* **Errors**: thiserror
+```rust
+// В common используем thiserror
+pub enum Error {
+    Crypto(snow::Error),
+    Io(std::io::Error),
+    InvalidPacket,
+    ReplayedPacket,  // для replay protection
+    // ...
+}
+
+// В client/server используем anyhow для контекста
+.context("Failed to perform handshake")?
+```
 
 ---
 
 ## Code Guidelines
 
-* `cargo fmt` обязателен
+* `cargo fmt` обязателен перед коммитом
 * `unsafe` запрещён без крайней необходимости
-* Ошибки через `Result` + `thiserror`
-* Модули маленькие и изолированные
 * Криптографические тесты не должны зависеть от сети
+* Rate-limited логирование для частых ошибок (UDP buffer overflow, replay packets)
 
 ---
 
 ## Non-Goals (MVP)
 
-* GUI
-* Mobile SDK
+* GUI, Mobile SDK
 * Advanced obfuscation (TLS camouflage, QUIC mimicry)
 * Multi-server routing
