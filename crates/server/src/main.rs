@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use gatekeeper_common::config::keys;
-use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport};
+use gatekeeper_common::{Packet, PacketType, Responder, ServerConfig, Transport, TunConfig, TunDevice};
 
 #[derive(Parser, Debug)]
 #[command(name = "gatekeeper-server")]
@@ -23,6 +23,10 @@ struct Args {
     /// Listen address (overrides config)
     #[arg(short, long)]
     listen: Option<String>,
+
+    /// Echo mode: don't create TUN, just echo packets back
+    #[arg(short, long)]
+    echo: bool,
 }
 
 /// Client session state (transport ready after handshake)
@@ -44,81 +48,35 @@ impl Server {
         }
     }
 
-    /// Handle incoming packet from a client
-    fn handle_packet(&mut self, addr: SocketAddr, packet: Packet) -> Result<Option<Packet>> {
-        match packet.packet_type {
-            PacketType::HandshakeInit => {
-                log::info!("[{}] Handshake init received", addr);
+    /// Handle handshake init from a client
+    fn handle_handshake(&mut self, addr: SocketAddr, payload: &[u8]) -> Result<(Packet, Transport)> {
+        log::info!("[{}] Handshake init received", addr);
 
-                // Create new responder for this client
-                let mut responder = Responder::new(&self.private_key)
-                    .context("Failed to create responder")?;
+        // Create new responder for this client
+        let mut responder = Responder::new(&self.private_key)
+            .context("Failed to create responder")?;
 
-                // Process handshake init message
-                let payload = responder
-                    .read_message(&packet.payload)
-                    .context("Failed to read handshake init")?;
+        // Process handshake init message
+        responder
+            .read_message(payload)
+            .context("Failed to read handshake init")?;
 
-                if !payload.is_empty() {
-                    log::debug!("[{}] Handshake payload: {:?}", addr, payload);
-                }
+        // Generate response
+        let response = responder
+            .write_message(&[])
+            .context("Failed to write handshake response")?;
 
-                // Generate response
-                let response = responder
-                    .write_message(&[])
-                    .context("Failed to write handshake response")?;
-
-                // IK handshake completes in 2 messages
-                log::info!("[{}] Handshake complete", addr);
-                if let Some(remote_key) = responder.get_remote_static() {
-                    log::info!("[{}] Client public key: {}", addr, keys::encode(remote_key));
-                }
-
-                // Convert to transport mode
-                let transport = responder
-                    .into_transport()
-                    .context("Failed to enter transport mode")?;
-                self.clients.insert(addr, transport);
-
-                Ok(Some(Packet::handshake_response(response)))
-            }
-
-            PacketType::HandshakeResponse => {
-                log::warn!("[{}] Unexpected handshake response from client", addr);
-                Ok(None)
-            }
-
-            PacketType::Data => {
-                // Get client's transport state
-                match self.clients.get_mut(&addr) {
-                    Some(transport) => {
-                        // Decrypt the data
-                        let plaintext = transport
-                            .decrypt(&packet.payload)
-                            .context("Failed to decrypt packet")?;
-
-                        log::info!(
-                            "[{}] Received: {} ({} bytes)",
-                            addr,
-                            String::from_utf8_lossy(&plaintext),
-                            plaintext.len()
-                        );
-
-                        // Echo back (encrypted)
-                        let response_data = format!("Echo: {}", String::from_utf8_lossy(&plaintext));
-                        let encrypted = transport
-                            .encrypt(response_data.as_bytes())
-                            .context("Failed to encrypt response")?;
-
-                        Ok(Some(Packet::data(encrypted)))
-                    }
-                    None => {
-                        log::warn!("[{}] Data from unknown client", addr);
-                        Ok(None)
-                    }
-                }
-            }
+        log::info!("[{}] Handshake complete", addr);
+        if let Some(remote_key) = responder.get_remote_static() {
+            log::info!("[{}] Client public key: {}", addr, keys::encode(remote_key));
         }
+
+        // Convert to transport mode
+        let transport = responder
+            .into_transport()
+            .context("Failed to enter transport mode")?;
+
+        Ok((Packet::handshake_response(response), transport))
     }
 }
 
@@ -132,6 +90,243 @@ fn load_config(path: &str) -> Result<ServerConfig> {
         log::warn!("Config file not found: {}, using defaults", path);
         Ok(ServerConfig::default())
     }
+}
+
+/// Echo mode: just echo back decrypted data
+async fn run_echo_mode(
+    socket: Arc<UdpSocket>,
+    server: Arc<Mutex<Server>>,
+) -> Result<()> {
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        let (len, addr) = socket.recv_from(&mut buf).await?;
+        let data = Bytes::copy_from_slice(&buf[..len]);
+
+        let packet = match Packet::decode(data) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[{}] Invalid packet: {}", addr, e);
+                continue;
+            }
+        };
+
+        let response = {
+            let mut server = server.lock().await;
+
+            match packet.packet_type {
+                PacketType::HandshakeInit => {
+                    match server.handle_handshake(addr, &packet.payload) {
+                        Ok((response, transport)) => {
+                            server.clients.insert(addr, transport);
+                            Some(response)
+                        }
+                        Err(e) => {
+                            log::error!("[{}] Handshake error: {}", addr, e);
+                            None
+                        }
+                    }
+                }
+                PacketType::HandshakeResponse => {
+                    log::warn!("[{}] Unexpected handshake response", addr);
+                    None
+                }
+                PacketType::Data => {
+                    match server.clients.get_mut(&addr) {
+                        Some(transport) => {
+                            match transport.decrypt(&packet.payload) {
+                                Ok(plaintext) => {
+                                    log::info!(
+                                        "[{}] Received: {} ({} bytes)",
+                                        addr,
+                                        String::from_utf8_lossy(&plaintext),
+                                        plaintext.len()
+                                    );
+
+                                    // Echo back
+                                    let response_data = format!("Echo: {}", String::from_utf8_lossy(&plaintext));
+                                    match transport.encrypt(response_data.as_bytes()) {
+                                        Ok(encrypted) => Some(Packet::data(encrypted)),
+                                        Err(e) => {
+                                            log::error!("[{}] Encrypt error: {}", addr, e);
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("[{}] Decrypt error: {}", addr, e);
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!("[{}] Data from unknown client", addr);
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(response_packet) = response {
+            if let Err(e) = socket.send_to(&response_packet.encode(), addr).await {
+                log::error!("[{}] Failed to send response: {}", addr, e);
+            }
+        }
+    }
+}
+
+/// VPN mode: forward traffic between UDP and TUN
+async fn run_vpn_mode(
+    socket: Arc<UdpSocket>,
+    server: Arc<Mutex<Server>>,
+    config: &ServerConfig,
+) -> Result<()> {
+    // Parse TUN config
+    let tun_address: Ipv4Addr = config.tun_address.parse()
+        .context("Invalid TUN address")?;
+    let tun_netmask: Ipv4Addr = config.tun_netmask.parse()
+        .context("Invalid TUN netmask")?;
+
+    let tun_config = TunConfig {
+        name: None,
+        address: tun_address,
+        netmask: tun_netmask,
+        mtu: config.tun_mtu,
+    };
+
+    // Create TUN device (requires root)
+    let tun_device = TunDevice::create(tun_config).await
+        .context("Failed to create TUN device. Are you running as root?")?;
+
+    log::info!("VPN server TUN interface: {}", tun_device.name());
+
+    let (mut tun_reader, mut tun_writer) = tun_device.split();
+
+    let socket_tx = socket.clone();
+    let socket_rx = socket;
+    let server_tx = server.clone();
+    let server_rx = server;
+
+    // Task 1: UDP -> TUN (incoming from clients)
+    let udp_to_tun = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+
+        loop {
+            let (len, addr) = match socket_rx.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("UDP recv error: {}", e);
+                    continue;
+                }
+            };
+
+            let data = Bytes::copy_from_slice(&buf[..len]);
+            let packet = match Packet::decode(data) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[{}] Invalid packet: {}", addr, e);
+                    continue;
+                }
+            };
+
+            let mut server = server_rx.lock().await;
+
+            match packet.packet_type {
+                PacketType::HandshakeInit => {
+                    match server.handle_handshake(addr, &packet.payload) {
+                        Ok((response, transport)) => {
+                            server.clients.insert(addr, transport);
+                            if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
+                                log::error!("[{}] Failed to send handshake response: {}", addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("[{}] Handshake error: {}", addr, e);
+                        }
+                    }
+                }
+                PacketType::HandshakeResponse => {
+                    log::warn!("[{}] Unexpected handshake response", addr);
+                }
+                PacketType::Data => {
+                    if let Some(transport) = server.clients.get_mut(&addr) {
+                        match transport.decrypt(&packet.payload) {
+                            Ok(plaintext) => {
+                                log::debug!("[{}] UDP -> TUN: {} bytes", addr, plaintext.len());
+                                if let Err(e) = tun_writer.write(&plaintext).await {
+                                    log::error!("TUN write error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[{}] Decrypt error: {}", addr, e);
+                            }
+                        }
+                    } else {
+                        log::warn!("[{}] Data from unknown client", addr);
+                    }
+                }
+            }
+        }
+    });
+
+    // Task 2: TUN -> UDP (outgoing to clients)
+    // Note: Simple implementation sends to first connected client
+    // A real VPN would parse IP headers to determine destination
+    let tun_to_udp = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+
+        loop {
+            let n = match tun_reader.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                Ok(_) => continue,
+                Err(e) => {
+                    log::error!("TUN read error: {}", e);
+                    continue;
+                }
+            };
+
+            let server = server_tx.lock().await;
+
+            // Send to all connected clients (broadcast for simplicity)
+            // A real VPN would route based on IP destination
+            for (addr, transport) in server.clients.iter() {
+                // Note: We need mutable access to transport for encryption
+                // This is a simplified version - real impl would use separate
+                // encryption state or lock per client
+                log::debug!("TUN -> UDP [{}]: {} bytes", addr, n);
+            }
+            drop(server);
+
+            // For now, we need a different approach for TUN -> UDP
+            // because we need mutable access to transport
+            let mut server = server_tx.lock().await;
+            let client_addrs: Vec<_> = server.clients.keys().copied().collect();
+
+            for addr in client_addrs {
+                if let Some(transport) = server.clients.get_mut(&addr) {
+                    match transport.encrypt(&buf[..n]) {
+                        Ok(encrypted) => {
+                            let packet = Packet::data(encrypted);
+                            if let Err(e) = socket_tx.send_to(&packet.encode(), addr).await {
+                                log::error!("[{}] UDP send error: {}", addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("[{}] Encrypt error: {}", addr, e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = udp_to_tun => log::error!("UDP->TUN task finished unexpectedly"),
+        _ = tun_to_udp => log::error!("TUN->UDP task finished unexpectedly"),
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -150,7 +345,6 @@ async fn main() -> Result<()> {
 
     // Check if private key is set
     if config.private_key.is_empty() {
-        // Generate a new keypair for demo purposes
         log::warn!("No private key configured, generating ephemeral keypair");
         let keypair = gatekeeper_common::crypto::generate_keypair()?;
         config.private_key = keys::encode(&keypair.private);
@@ -168,41 +362,14 @@ async fn main() -> Result<()> {
 
     log::info!("GatekeeperVPN server listening on {}", config.listen);
 
+    let socket = Arc::new(socket);
     let server = Arc::new(Mutex::new(Server::new(private_key)));
-    let mut buf = vec![0u8; 65535];
 
-    loop {
-        let (len, addr) = socket.recv_from(&mut buf).await?;
-        let data = Bytes::copy_from_slice(&buf[..len]);
-
-        log::debug!("[{}] Received {} bytes", addr, len);
-
-        // Parse packet
-        let packet = match Packet::decode(data) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[{}] Invalid packet: {}", addr, e);
-                continue;
-            }
-        };
-
-        // Handle packet
-        let response = {
-            let mut server = server.lock().await;
-            server.handle_packet(addr, packet)
-        };
-
-        match response {
-            Ok(Some(response_packet)) => {
-                let response_data = response_packet.encode();
-                if let Err(e) = socket.send_to(&response_data, addr).await {
-                    log::error!("[{}] Failed to send response: {}", addr, e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::error!("[{}] Error handling packet: {}", addr, e);
-            }
-        }
+    if args.echo {
+        log::info!("Running in ECHO mode (no TUN)");
+        run_echo_mode(socket, server).await
+    } else {
+        log::info!("Running in VPN mode");
+        run_vpn_mode(socket, server, &config).await
     }
 }

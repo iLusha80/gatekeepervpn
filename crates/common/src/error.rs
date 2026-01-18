@@ -19,4 +19,7 @@ pub enum Error {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("TUN device error: {0}")]
+    Tun(String),
 }

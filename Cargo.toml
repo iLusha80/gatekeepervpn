@@ -35,3 +35,6 @@ env_logger = "0.11"
 # Errors
 thiserror = "2.0"
 anyhow = "1.0"
+
+# Network
+tun = { version = "0.8", features = ["async"] }

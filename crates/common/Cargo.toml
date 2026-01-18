@@ -18,5 +18,12 @@ toml.workspace = true
 # Errors
 thiserror.workspace = true
 
+# Network
+tun.workspace = true
+
+# Async & Logging
+tokio = { workspace = true, features = ["io-util"] }
+log.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }

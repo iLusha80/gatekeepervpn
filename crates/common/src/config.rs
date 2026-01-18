@@ -9,6 +9,27 @@ pub struct ServerConfig {
     pub listen: String,
     /// Server's private key (base64 encoded)
     pub private_key: String,
+    /// TUN interface IP address
+    #[serde(default = "default_server_tun_address")]
+    pub tun_address: String,
+    /// TUN interface netmask
+    #[serde(default = "default_tun_netmask_server")]
+    pub tun_netmask: String,
+    /// TUN MTU
+    #[serde(default = "default_tun_mtu_server")]
+    pub tun_mtu: u16,
+}
+
+fn default_server_tun_address() -> String {
+    "10.0.0.1".to_string()
+}
+
+fn default_tun_netmask_server() -> String {
+    "255.255.255.0".to_string()
+}
+
+fn default_tun_mtu_server() -> u16 {
+    1400
 }
 
 impl Default for ServerConfig {
@@ -16,6 +37,9 @@ impl Default for ServerConfig {
         Self {
             listen: "0.0.0.0:51820".to_string(),
             private_key: String::new(),
+            tun_address: default_server_tun_address(),
+            tun_netmask: default_tun_netmask_server(),
+            tun_mtu: default_tun_mtu_server(),
         }
     }
 }
@@ -29,6 +53,27 @@ pub struct ClientConfig {
     pub private_key: String,
     /// Server's public key (base64 encoded)
     pub server_public_key: String,
+    /// TUN interface IP address
+    #[serde(default = "default_tun_address")]
+    pub tun_address: String,
+    /// TUN interface netmask
+    #[serde(default = "default_tun_netmask")]
+    pub tun_netmask: String,
+    /// TUN MTU
+    #[serde(default = "default_tun_mtu")]
+    pub tun_mtu: u16,
+}
+
+fn default_tun_address() -> String {
+    "10.0.0.2".to_string()
+}
+
+fn default_tun_netmask() -> String {
+    "255.255.255.0".to_string()
+}
+
+fn default_tun_mtu() -> u16 {
+    1400
 }
 
 impl Default for ClientConfig {
@@ -37,6 +82,9 @@ impl Default for ClientConfig {
             server: "127.0.0.1:51820".to_string(),
             private_key: String::new(),
             server_public_key: String::new(),
+            tun_address: default_tun_address(),
+            tun_netmask: default_tun_netmask(),
+            tun_mtu: default_tun_mtu(),
         }
     }
 }
