@@ -1,0 +1,29 @@
+[package]
+name = "gatekeeper-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gatekeeper-client"
+path = "src/main.rs"
+
+[dependencies]
+gatekeeper-common = { path = "../common" }
+
+# Async
+tokio.workspace = true
+
+# Config
+serde.workspace = true
+toml.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Logging
+log.workspace = true
+env_logger.workspace = true
+
+# Errors
+anyhow.workspace = true

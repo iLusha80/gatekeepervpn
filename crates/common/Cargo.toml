@@ -1,0 +1,17 @@
+[package]
+name = "gatekeeper-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Crypto
+snow.workspace = true
+rand.workspace = true
+
+# Serialization
+serde.workspace = true
+bytes.workspace = true
+
+# Errors
+thiserror.workspace = true
