@@ -4,7 +4,8 @@
 //! - Initiator (client) knows responder's (server) static public key
 //! - Provides mutual authentication and forward secrecy
 
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{Builder, HandshakeState, StatelessTransportState};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Error;
 use crate::crypto::NOISE_PATTERN;
@@ -62,7 +63,8 @@ impl Initiator {
         if !self.state.is_handshake_finished() {
             return Err(Error::HandshakeNotCompleted);
         }
-        Ok(Transport::new(self.state.into_transport_mode()?))
+        let transport = self.state.into_stateless_transport_mode()?;
+        Ok(Transport::new(transport))
     }
 }
 
@@ -119,46 +121,162 @@ impl Responder {
         if !self.state.is_handshake_finished() {
             return Err(Error::HandshakeNotCompleted);
         }
-        Ok(Transport::new(self.state.into_transport_mode()?))
+        let transport = self.state.into_stateless_transport_mode()?;
+        Ok(Transport::new(transport))
     }
 }
 
 /// Encrypted transport after handshake completion
+///
+/// Uses StatelessTransportState with explicit nonce for each packet,
+/// allowing out-of-order packet delivery over UDP.
 pub struct Transport {
-    state: TransportState,
+    state: StatelessTransportState,
+    /// Counter for outgoing messages
+    send_counter: AtomicU64,
+    /// Sliding window for replay protection
+    recv_window: SlidingWindow,
 }
 
-/// Maximum overhead added by encryption (poly1305 tag)
+/// Maximum overhead added by encryption (poly1305 tag + 8-byte counter)
 pub const TRANSPORT_OVERHEAD: usize = 16;
 
-impl Transport {
-    fn new(state: TransportState) -> Self {
-        Self { state }
+/// Counter size in bytes (prepended to each encrypted message)
+pub const COUNTER_SIZE: usize = 8;
+
+/// Sliding window size for replay protection (bits)
+const WINDOW_SIZE: u64 = 2048;
+
+/// Sliding window for replay protection and out-of-order handling
+struct SlidingWindow {
+    /// Highest nonce seen
+    highest: AtomicU64,
+    /// Bitmap for nonces in window [highest - WINDOW_SIZE + 1, highest]
+    bitmap: std::sync::Mutex<Vec<u64>>,
+}
+
+impl SlidingWindow {
+    fn new() -> Self {
+        Self {
+            highest: AtomicU64::new(0),
+            bitmap: std::sync::Mutex::new(vec![0u64; (WINDOW_SIZE / 64) as usize]),
+        }
     }
 
-    /// Encrypt a message
+    /// Check if nonce is valid (not replayed) and mark as seen
+    /// Returns true if valid, false if replayed or too old
+    fn check_and_mark(&self, nonce: u64) -> bool {
+        let highest = self.highest.load(Ordering::Relaxed);
+
+        // Too old - outside the window
+        if nonce + WINDOW_SIZE <= highest {
+            return false;
+        }
+
+        let mut bitmap = self.bitmap.lock().unwrap();
+
+        // If new highest, update and shift window
+        if nonce > highest {
+            let shift = nonce - highest;
+            if shift >= WINDOW_SIZE {
+                // Reset bitmap
+                for b in bitmap.iter_mut() {
+                    *b = 0;
+                }
+            } else {
+                // Shift bitmap
+                let shift_words = (shift / 64) as usize;
+                let shift_bits = (shift % 64) as u32;
+
+                if shift_words > 0 {
+                    bitmap.rotate_left(shift_words);
+                    for b in bitmap.iter_mut().rev().take(shift_words) {
+                        *b = 0;
+                    }
+                }
+                if shift_bits > 0 {
+                    let mut carry = 0u64;
+                    for b in bitmap.iter_mut() {
+                        let new_carry = *b >> (64 - shift_bits);
+                        *b = (*b << shift_bits) | carry;
+                        carry = new_carry;
+                    }
+                }
+            }
+            self.highest.store(nonce, Ordering::Relaxed);
+        }
+
+        // Calculate position in bitmap
+        let current_highest = self.highest.load(Ordering::Relaxed);
+        let index = current_highest - nonce;
+        let word_idx = (index / 64) as usize;
+        let bit_idx = (index % 64) as u32;
+
+        if word_idx >= bitmap.len() {
+            return false;
+        }
+
+        // Check if already seen
+        let mask = 1u64 << bit_idx;
+        if bitmap[word_idx] & mask != 0 {
+            return false; // Replay
+        }
+
+        // Mark as seen
+        bitmap[word_idx] |= mask;
+        true
+    }
+}
+
+impl Transport {
+    fn new(state: StatelessTransportState) -> Self {
+        Self {
+            state,
+            send_counter: AtomicU64::new(0),
+            recv_window: SlidingWindow::new(),
+        }
+    }
+
+    /// Encrypt a message with explicit counter
     ///
-    /// # Arguments
-    /// * `plaintext` - Data to encrypt
-    ///
-    /// Returns encrypted ciphertext
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut buf = vec![0u8; plaintext.len() + TRANSPORT_OVERHEAD];
-        let len = self.state.write_message(plaintext, &mut buf)?;
-        buf.truncate(len);
+    /// Returns: [8-byte counter][encrypted ciphertext]
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+
+        let mut buf = vec![0u8; COUNTER_SIZE + plaintext.len() + TRANSPORT_OVERHEAD];
+
+        // Write counter (little-endian)
+        buf[..COUNTER_SIZE].copy_from_slice(&counter.to_le_bytes());
+
+        // Encrypt with counter as nonce
+        let len = self.state.write_message(counter, plaintext, &mut buf[COUNTER_SIZE..])?;
+        buf.truncate(COUNTER_SIZE + len);
+
         Ok(buf)
     }
 
-    /// Decrypt a message
+    /// Decrypt a message with explicit counter
     ///
-    /// # Arguments
-    /// * `ciphertext` - Encrypted data
-    ///
-    /// Returns decrypted plaintext
-    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+    /// Input: [8-byte counter][encrypted ciphertext]
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+        if data.len() < COUNTER_SIZE + TRANSPORT_OVERHEAD {
+            return Err(Error::InvalidPacket);
+        }
+
+        // Read counter
+        let counter = u64::from_le_bytes(data[..COUNTER_SIZE].try_into().unwrap());
+
+        // Check replay protection
+        if !self.recv_window.check_and_mark(counter) {
+            return Err(Error::Crypto(snow::Error::Decrypt));
+        }
+
+        // Decrypt
+        let ciphertext = &data[COUNTER_SIZE..];
         let mut buf = vec![0u8; ciphertext.len()];
-        let len = self.state.read_message(ciphertext, &mut buf)?;
+        let len = self.state.read_message(counter, ciphertext, &mut buf)?;
         buf.truncate(len);
+
         Ok(buf)
     }
 }
@@ -219,8 +337,8 @@ mod tests {
         initiator.read_message(&msg2).unwrap();
 
         // Convert to transport mode
-        let mut client_transport = initiator.into_transport().unwrap();
-        let mut server_transport = responder.into_transport().unwrap();
+        let client_transport = initiator.into_transport().unwrap();
+        let server_transport = responder.into_transport().unwrap();
 
         // Test encryption/decryption client -> server
         let plaintext = b"secret message from client";

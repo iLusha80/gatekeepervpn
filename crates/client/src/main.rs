@@ -258,7 +258,7 @@ async fn run_vpn_mode(
 
             // Encrypt and send
             let encrypted = {
-                let mut transport = transport_tx.lock().await;
+                let transport = transport_tx.lock().await;
                 match transport.encrypt(&buf[..n]) {
                     Ok(data) => data,
                     Err(e) => {
@@ -305,7 +305,7 @@ async fn run_vpn_mode(
                 PacketType::Data => {
                     // Decrypt
                     let plaintext = {
-                        let mut transport = transport_rx.lock().await;
+                        let transport = transport_rx.lock().await;
                         match transport.decrypt(&packet.payload) {
                             Ok(data) => data,
                             Err(e) => {

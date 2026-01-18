@@ -52,7 +52,7 @@ async fn test_udp_handshake_and_echo() {
             .unwrap();
 
         assert!(responder.is_finished());
-        let mut transport = responder.into_transport().unwrap();
+        let transport = responder.into_transport().unwrap();
 
         // Receive encrypted data
         let (len, _) = server_socket.recv_from(&mut buf).await.unwrap();
@@ -100,7 +100,7 @@ async fn test_udp_handshake_and_echo() {
     initiator.read_message(&packet.payload).unwrap();
     assert!(initiator.is_finished());
 
-    let mut transport = initiator.into_transport().unwrap();
+    let transport = initiator.into_transport().unwrap();
 
     // Send encrypted data
     let encrypted = transport.encrypt(b"Hello, Server!").unwrap();
