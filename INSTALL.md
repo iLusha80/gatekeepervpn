@@ -26,7 +26,7 @@ git clone https://github.com/your-username/gatekeepervpn.git
 cd gatekeepervpn
 
 # 3. Запустите автоматическую установку
-sudo bash scripts/setup-server-full.sh
+sudo bash scripts/setup.sh
 ```
 
 **Скрипт автоматически:**

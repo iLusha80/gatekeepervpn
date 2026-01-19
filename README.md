@@ -22,7 +22,7 @@
 cd /opt
 git clone https://github.com/your-username/gatekeepervpn.git
 cd gatekeepervpn
-sudo bash scripts/setup-server-full.sh
+sudo bash scripts/setup.sh
 ```
 
 **Скрипт автоматически настроит:**
