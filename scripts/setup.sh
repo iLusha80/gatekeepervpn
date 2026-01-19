@@ -295,16 +295,12 @@ generate_config() {
         --tun-address "$SERVER_IP" \
         --output "$CONFIG_DIR/server.toml" || error_exit "Failed to generate server config"
 
-    # Add NAT configuration (БЕЗ переносов строк!)
-    {
-        echo ""
-        echo "# NAT configuration"
-        echo "# External network interface for internet access"
-        echo "external_interface = \"$INTERFACE\""
-        echo ""
-        echo "# Enable automatic NAT configuration (requires root)"
-        echo "enable_nat = true"
-    } >> "$CONFIG_DIR/server.toml" || error_exit "Failed to add NAT config"
+    # Replace NAT configuration values (gkvpn already adds these fields with defaults)
+    # We need to UPDATE them, not ADD new ones
+    sed -i "s/^external_interface = .*/external_interface = \"$INTERFACE\"/" "$CONFIG_DIR/server.toml" || \
+        error_exit "Failed to update external_interface"
+    sed -i "s/^enable_nat = .*/enable_nat = true/" "$CONFIG_DIR/server.toml" || \
+        error_exit "Failed to update enable_nat"
 
     # Initialize peers
     "$INSTALL_DIR/gkvpn" --config-dir "$CONFIG_DIR" init \
