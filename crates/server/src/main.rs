@@ -21,9 +21,9 @@ use tokio::time::interval;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    Error as CommonError, Packet, PacketType, PeersConfig, Responder, ServerConfig, Transport,
-    TunConfig, TunDevice, VpnErrorLoggers, configure_socket, get_destination_ip,
-    print_nat_instructions,
+    Error as CommonError, NatConfig, Packet, PacketType, PeersConfig, Responder, ServerConfig,
+    Transport, TunConfig, TunDevice, VpnErrorLoggers, configure_socket, enable_ip_forwarding,
+    get_destination_ip, print_nat_instructions, setup_nat,
 };
 
 /// Default peers file location
@@ -450,7 +450,7 @@ async fn run_vpn_mode(
 
     log::info!("VPN server TUN interface: {}", tun_device.name());
 
-    // Print NAT setup instructions
+    // Setup NAT if enabled
     let subnet = config
         .tun_address
         .rsplitn(2, '.')
@@ -458,7 +458,36 @@ async fn run_vpn_mode(
         .next()
         .unwrap_or("10.0.0");
     let vpn_subnet = format!("{}.0/24", subnet);
-    print_nat_instructions(tun_device.name(), &vpn_subnet);
+
+    if config.enable_nat {
+        log::info!("Configuring NAT...");
+
+        // Enable IP forwarding
+        if let Err(e) = enable_ip_forwarding() {
+            log::error!("Failed to enable IP forwarding: {}", e);
+            log::error!("NAT will not work without IP forwarding!");
+            print_nat_instructions(tun_device.name(), &vpn_subnet);
+        } else {
+            // Setup NAT rules
+            let nat_config = NatConfig {
+                tun_interface: tun_device.name().to_string(),
+                external_interface: config.external_interface.clone(),
+                vpn_subnet: vpn_subnet.clone(),
+            };
+
+            if let Err(e) = setup_nat(&nat_config) {
+                log::error!("Failed to setup NAT: {}", e);
+                log::error!("You may need to configure NAT manually:");
+                print_nat_instructions(tun_device.name(), &vpn_subnet);
+            } else {
+                log::info!("NAT configured successfully on interface {}", config.external_interface);
+            }
+        }
+    } else {
+        log::warn!("NAT configuration disabled (enable_nat = false)");
+        log::warn!("Clients will not have internet access unless you configure NAT manually:");
+        print_nat_instructions(tun_device.name(), &vpn_subnet);
+    }
 
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 

@@ -141,6 +141,12 @@ pub struct ServerConfig {
     /// TUN MTU
     #[serde(default = "default_tun_mtu_server")]
     pub tun_mtu: u16,
+    /// External network interface for NAT (e.g., "eth0", "ens3", "en0")
+    #[serde(default = "default_external_interface")]
+    pub external_interface: String,
+    /// Enable automatic NAT configuration
+    #[serde(default = "default_enable_nat")]
+    pub enable_nat: bool,
 }
 
 fn default_server_tun_address() -> String {
@@ -155,6 +161,25 @@ fn default_tun_mtu_server() -> u16 {
     1400
 }
 
+fn default_external_interface() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        "eth0".to_string()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "en0".to_string()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "eth0".to_string()
+    }
+}
+
+fn default_enable_nat() -> bool {
+    true
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -163,6 +188,8 @@ impl Default for ServerConfig {
             tun_address: default_server_tun_address(),
             tun_netmask: default_tun_netmask_server(),
             tun_mtu: default_tun_mtu_server(),
+            external_interface: default_external_interface(),
+            enable_nat: default_enable_nat(),
         }
     }
 }

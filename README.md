@@ -23,7 +23,7 @@ cargo build --release
 ### Установка сервера (Linux)
 
 ```bash
-sudo ./scripts/setup.sh
+ ./scripts/setup.sh # если вошли под root
 ```
 
 Скрипт интерактивно настроит:

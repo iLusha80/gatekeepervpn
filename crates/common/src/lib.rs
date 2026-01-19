@@ -17,7 +17,7 @@ pub use handshake::{Initiator, Responder, Transport};
 pub use ip_parser::{get_destination_ip, get_source_ip, get_src_dst_ips, is_ipv4};
 pub use ip_pool::IpPool;
 pub use logging::{RateLimitedLogger, VpnErrorLoggers};
-pub use nat::{NatConfig, print_nat_instructions};
+pub use nat::{NatConfig, enable_ip_forwarding, print_nat_instructions, setup_nat};
 pub use protocol::{Packet, PacketType};
 pub use routing::{RouteConfig, cleanup_routes, setup_routes};
 pub use socket::{DEFAULT_BUFFER_SIZE, configure_socket, configure_socket_buffers};

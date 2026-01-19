@@ -6,3 +6,18 @@ listen = "0.0.0.0:51820"
 # Server's private key (base64 encoded)
 # Generate with: cargo run --bin gatekeeper-server (will print a new keypair)
 private_key = ""
+
+# TUN interface configuration
+tun_address = "10.0.0.1"
+tun_netmask = "255.255.255.0"
+tun_mtu = 1400
+
+# NAT configuration
+# External network interface for internet access (e.g., "eth0", "ens3" on Linux, "en0" on macOS)
+external_interface = "eth0"
+
+# Enable automatic NAT configuration (requires root)
+# When enabled, the server will automatically:
+# - Enable IP forwarding
+# - Setup NAT/masquerading rules
+enable_nat = true
