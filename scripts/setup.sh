@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# GatekeeperVPN Full Server Setup Script
+# GatekeeperVPN Server Setup Script
 #
-# Полная автоматическая установка и настройка сервера на чистой системе:
+# Полная автоматическая установка и настройка сервера:
 # - Установка зависимостей
 # - Сборка проекта
 # - Установка бинарников
@@ -12,7 +12,8 @@
 # - Запуск сервера
 #
 
-set -e
+# НЕ используем set -e чтобы контролировать ошибки
+set -o pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -33,11 +34,17 @@ SYSTEMD_DIR="/etc/systemd/system"
 # Global variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+LOG_FILE="/tmp/gatekeeper-setup-$(date +%Y%m%d-%H%M%S).log"
 SUBNET=""
 MASK=""
 SERVER_IP=""
 PORT=""
 INTERFACE=""
+INTERFACE_IP=""
+
+# Redirect all output to log file AND console
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
 
 # Print colored message
 print_msg() {
@@ -53,6 +60,19 @@ print_step() {
     print_msg "$BLUE" "  ▶ $1"
     print_msg "$CYAN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
+
+# Error handler
+error_exit() {
+    local msg="$1"
+    print_msg "$RED" "❌ ERROR: $msg"
+    print_msg "$YELLOW" ""
+    print_msg "$YELLOW" "Installation log saved to: $LOG_FILE"
+    print_msg "$YELLOW" "Please send this log file for troubleshooting."
+    exit 1
+}
+
+# Trap errors
+trap 'error_exit "Script failed at line $LINENO"' ERR
 
 # Check if running as root
 check_root() {
@@ -90,7 +110,7 @@ install_dependencies() {
 
     if [[ "$PKG_MANAGER" == "apt-get" ]]; then
         print_msg "$YELLOW" "Updating package list..."
-        apt-get update -qq
+        apt-get update -qq || error_exit "Failed to update package list"
 
         print_msg "$YELLOW" "Installing required packages..."
         apt-get install -y \
@@ -101,7 +121,7 @@ install_dependencies() {
             git \
             iptables \
             iptables-persistent \
-            netfilter-persistent
+            netfilter-persistent || error_exit "Failed to install system packages"
 
         print_msg "$GREEN" "✓ System packages installed"
 
@@ -115,7 +135,7 @@ install_dependencies() {
             openssl-devel \
             curl \
             git \
-            iptables-services
+            iptables-services || error_exit "Failed to install system packages"
 
         print_msg "$GREEN" "✓ System packages installed"
     else
@@ -127,25 +147,42 @@ install_dependencies() {
 install_rust() {
     print_step "Checking Rust installation"
 
+    # Check if cargo is available (including in PATH)
     if command -v cargo &> /dev/null; then
         RUST_VERSION=$(rustc --version | cut -d' ' -f2)
         print_msg "$GREEN" "✓ Rust already installed: $RUST_VERSION"
         return
     fi
 
+    # Try to source cargo env if it exists
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        source "$HOME/.cargo/env"
+        if command -v cargo &> /dev/null; then
+            RUST_VERSION=$(rustc --version | cut -d' ' -f2)
+            print_msg "$GREEN" "✓ Rust found in $HOME/.cargo: $RUST_VERSION"
+            return
+        fi
+    fi
+
     print_msg "$YELLOW" "Installing Rust..."
 
-    # Install rustup for root user
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    # Install rustup
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable || \
+        error_exit "Failed to install Rust"
 
     # Source cargo env
-    source "$HOME/.cargo/env"
+    source "$HOME/.cargo/env" || error_exit "Failed to source cargo environment"
+
+    # Verify installation
+    if ! command -v cargo &> /dev/null; then
+        error_exit "Cargo not found after installation"
+    fi
 
     RUST_VERSION=$(rustc --version | cut -d' ' -f2)
     print_msg "$GREEN" "✓ Rust installed: $RUST_VERSION"
 }
 
-# Get network interface for NAT
+# Get network interface
 get_interface() {
     print_step "Detecting network interface"
 
@@ -153,18 +190,20 @@ get_interface() {
     INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 
     if [[ -z "$INTERFACE" ]]; then
-        print_msg "$RED" "❌ Could not auto-detect network interface"
-        exit 1
+        error_exit "Could not auto-detect network interface"
     fi
 
     # Verify interface exists
     if ! ip link show "$INTERFACE" &> /dev/null; then
-        print_msg "$RED" "❌ Interface $INTERFACE not found"
-        exit 1
+        error_exit "Interface $INTERFACE not found"
     fi
 
     # Get interface IP
     INTERFACE_IP=$(ip -4 addr show "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+
+    if [[ -z "$INTERFACE_IP" ]]; then
+        error_exit "Could not get IP address for interface $INTERFACE"
+    fi
 
     print_msg "$GREEN" "✓ External interface: $INTERFACE ($INTERFACE_IP)"
 }
@@ -173,7 +212,6 @@ get_interface() {
 configure_subnet() {
     print_step "Configuring VPN subnet"
 
-    # Use defaults for automated setup
     SUBNET=$DEFAULT_SUBNET
     MASK=$DEFAULT_MASK
 
@@ -198,17 +236,24 @@ configure_port() {
 build_project() {
     print_step "Building GatekeeperVPN from source"
 
-    cd "$PROJECT_ROOT"
+    cd "$PROJECT_ROOT" || error_exit "Failed to change to project directory"
 
     # Ensure cargo is in PATH
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        source "$HOME/.cargo/env"
+    fi
     export PATH="$HOME/.cargo/bin:$PATH"
 
+    # Verify cargo is available
+    if ! command -v cargo &> /dev/null; then
+        error_exit "Cargo not found in PATH"
+    fi
+
     print_msg "$YELLOW" "Running cargo build --release (this may take a few minutes)..."
-    cargo build --release 2>&1 | grep -E "(Compiling|Finished)" || true
+    cargo build --release || error_exit "Cargo build failed"
 
     if [[ ! -f "$PROJECT_ROOT/target/release/gatekeeper-server" ]]; then
-        print_msg "$RED" "❌ Build failed: gatekeeper-server binary not found"
-        exit 1
+        error_exit "Build failed: gatekeeper-server binary not found"
     fi
 
     print_msg "$GREEN" "✓ Build complete"
@@ -218,9 +263,12 @@ build_project() {
 install_binaries() {
     print_step "Installing binaries"
 
-    install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-server" "$INSTALL_DIR/"
-    install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-client" "$INSTALL_DIR/"
-    install -m 755 "$PROJECT_ROOT/target/release/gkvpn" "$INSTALL_DIR/"
+    install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-server" "$INSTALL_DIR/" || \
+        error_exit "Failed to install gatekeeper-server"
+    install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-client" "$INSTALL_DIR/" || \
+        error_exit "Failed to install gatekeeper-client"
+    install -m 755 "$PROJECT_ROOT/target/release/gkvpn" "$INSTALL_DIR/" || \
+        error_exit "Failed to install gkvpn"
 
     print_msg "$GREEN" "✓ Installed to $INSTALL_DIR/"
     print_msg "$GREEN" "  - gatekeeper-server"
@@ -232,36 +280,36 @@ install_binaries() {
 generate_config() {
     print_step "Generating server configuration"
 
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$CONFIG_DIR/profiles"
+    mkdir -p "$CONFIG_DIR" || error_exit "Failed to create config directory"
+    mkdir -p "$CONFIG_DIR/profiles" || error_exit "Failed to create profiles directory"
 
     # Generate server config with keys
     "$INSTALL_DIR/gkvpn" generate-server \
         --listen "0.0.0.0:$PORT" \
         --tun-address "$SERVER_IP" \
-        --output "$CONFIG_DIR/server.toml"
+        --output "$CONFIG_DIR/server.toml" || error_exit "Failed to generate server config"
 
-    # Add NAT configuration
-    cat >> "$CONFIG_DIR/server.toml" << EOF
-
-# NAT configuration
-# External network interface for internet access
-external_interface = "$INTERFACE"
-
-# Enable automatic NAT configuration (requires root)
-enable_nat = true
-EOF
+    # Add NAT configuration (БЕЗ переносов строк!)
+    {
+        echo ""
+        echo "# NAT configuration"
+        echo "# External network interface for internet access"
+        echo "external_interface = \"$INTERFACE\""
+        echo ""
+        echo "# Enable automatic NAT configuration (requires root)"
+        echo "enable_nat = true"
+    } >> "$CONFIG_DIR/server.toml" || error_exit "Failed to add NAT config"
 
     # Initialize peers
     "$INSTALL_DIR/gkvpn" --config-dir "$CONFIG_DIR" init \
         --subnet "$SUBNET" \
         --mask "$MASK" \
-        --force
+        --force || error_exit "Failed to initialize peers"
 
     # Set permissions
-    chmod 600 "$CONFIG_DIR/server.toml"
-    chmod 600 "$CONFIG_DIR/peers.toml"
-    chmod 755 "$CONFIG_DIR/profiles"
+    chmod 600 "$CONFIG_DIR/server.toml" || error_exit "Failed to set permissions on server.toml"
+    chmod 600 "$CONFIG_DIR/peers.toml" || error_exit "Failed to set permissions on peers.toml"
+    chmod 755 "$CONFIG_DIR/profiles" || error_exit "Failed to set permissions on profiles dir"
 
     print_msg "$GREEN" "✓ Configuration generated at $CONFIG_DIR/"
 }
@@ -271,18 +319,18 @@ setup_ip_forwarding() {
     print_step "Enabling IP forwarding"
 
     # Enable immediately
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null || error_exit "Failed to enable IP forwarding"
 
     # Make persistent
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-gatekeeper.conf
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-gatekeeper.conf || \
+        error_exit "Failed to make IP forwarding persistent"
 
     # Verify
     FORWARD_STATUS=$(sysctl -n net.ipv4.ip_forward)
     if [[ "$FORWARD_STATUS" == "1" ]]; then
         print_msg "$GREEN" "✓ IP forwarding enabled"
     else
-        print_msg "$RED" "❌ Failed to enable IP forwarding"
-        exit 1
+        error_exit "IP forwarding verification failed"
     fi
 }
 
@@ -295,85 +343,57 @@ setup_nat() {
     print_msg "$YELLOW" "Setting up iptables rules..."
 
     # NAT: POSTROUTING (masquerade VPN traffic)
-    iptables -t nat -C POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE
-
+    if ! iptables -t nat -C POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE || \
+            error_exit "Failed to add NAT rule"
+    fi
     print_msg "$GREEN" "  ✓ NAT rule added: $VPN_SUBNET -> $INTERFACE"
 
     # FORWARD: Allow VPN traffic forwarding
-    iptables -C FORWARD -i tun+ -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i tun+ -j ACCEPT
+    if ! iptables -C FORWARD -i tun+ -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i tun+ -j ACCEPT || error_exit "Failed to add FORWARD rule"
+    fi
 
-    iptables -C FORWARD -o tun+ -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -o tun+ -j ACCEPT
-
+    if ! iptables -C FORWARD -o tun+ -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -o tun+ -j ACCEPT || error_exit "Failed to add FORWARD rule"
+    fi
     print_msg "$GREEN" "  ✓ FORWARD rules added for tun interfaces"
 
     # FORWARD: Specific interface forwarding
-    iptables -C FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT
+    if ! iptables -C FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT || error_exit "Failed to add FORWARD rule"
+    fi
 
-    iptables -C FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
-
+    if ! iptables -C FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT || \
+            error_exit "Failed to add FORWARD rule"
+    fi
     print_msg "$GREEN" "  ✓ FORWARD rules added: tun+ <-> $INTERFACE"
 
     # Save iptables rules
     if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save
+        netfilter-persistent save >/dev/null 2>&1 || print_msg "$YELLOW" "  ⚠ Failed to save iptables rules"
         print_msg "$GREEN" "  ✓ Rules saved via netfilter-persistent"
     elif command -v iptables-save &> /dev/null; then
         mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
+        iptables-save > /etc/iptables/rules.v4 || print_msg "$YELLOW" "  ⚠ Failed to save iptables rules"
         print_msg "$GREEN" "  ✓ Rules saved to /etc/iptables/rules.v4"
     fi
 
     # Open VPN port in firewall (if ufw is active)
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$PORT/udp" > /dev/null
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$PORT/udp" > /dev/null 2>&1 || true
         print_msg "$GREEN" "  ✓ UFW: opened port $PORT/udp"
     fi
 
     print_msg "$GREEN" "✓ NAT and firewall configured successfully"
 }
 
-# Verify NAT configuration
-verify_nat() {
-    print_step "Verifying NAT configuration"
-
-    local VPN_SUBNET="$SUBNET/$MASK"
-    local ERRORS=0
-
-    # Check MASQUERADE rule
-    if iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET"; then
-        print_msg "$GREEN" "✓ NAT MASQUERADE rule present"
-    else
-        print_msg "$YELLOW" "⚠ NAT MASQUERADE rule not found (may be OK)"
-        ((ERRORS++))
-    fi
-
-    # Check FORWARD rules (tun or tun+)
-    if iptables -L FORWARD -n | grep -qE "tun\+?"; then
-        print_msg "$GREEN" "✓ FORWARD rules present"
-    else
-        print_msg "$YELLOW" "⚠ FORWARD rules not found (may be OK)"
-        ((ERRORS++))
-    fi
-
-    # Don't fail on verification errors - just warn
-    if [[ $ERRORS -gt 0 ]]; then
-        print_msg "$YELLOW" "⚠ Some verification checks failed, but continuing anyway"
-        print_msg "$YELLOW" "  (Rules will be configured when server starts)"
-    fi
-
-    return 0
-}
-
 # Create systemd service
 install_systemd() {
     print_step "Installing systemd service"
 
-    cat > "$SYSTEMD_DIR/gatekeeper.service" << EOF
+    cat > "$SYSTEMD_DIR/gatekeeper.service" << EOF || error_exit "Failed to create systemd service"
 [Unit]
 Description=GatekeeperVPN Server
 Documentation=https://github.com/your-org/gatekeepervpn
@@ -399,10 +419,10 @@ WantedBy=multi-user.target
 EOF
 
     # Reload systemd
-    systemctl daemon-reload
+    systemctl daemon-reload || error_exit "Failed to reload systemd"
 
     # Enable service
-    systemctl enable gatekeeper.service
+    systemctl enable gatekeeper.service || error_exit "Failed to enable service"
 
     print_msg "$GREEN" "✓ Systemd service installed and enabled"
 }
@@ -411,18 +431,19 @@ EOF
 start_service() {
     print_step "Starting GatekeeperVPN server"
 
-    systemctl start gatekeeper.service
+    systemctl start gatekeeper.service || error_exit "Failed to start service"
 
-    # Wait a moment for service to start
-    sleep 2
+    # Wait for service to start
+    sleep 3
 
     # Check status
     if systemctl is-active --quiet gatekeeper.service; then
         print_msg "$GREEN" "✓ Server started successfully"
     else
         print_msg "$RED" "❌ Server failed to start"
-        print_msg "$YELLOW" "Check logs with: journalctl -u gatekeeper -n 50"
-        exit 1
+        print_msg "$YELLOW" "Last 20 log lines:"
+        journalctl -u gatekeeper -n 20 --no-pager
+        error_exit "Service failed to start"
     fi
 }
 
@@ -474,6 +495,9 @@ print_summary() {
     echo "   2. Copy the client profile from: $CONFIG_DIR/profiles/myclient.conf"
     echo "   3. Run the client: gatekeeper-client -c myclient.conf"
     echo ""
+
+    print_msg "$GREEN" "📝 Installation log saved to: $LOG_FILE"
+    echo ""
 }
 
 # Main installation flow
@@ -484,6 +508,8 @@ main() {
     print_msg "$CYAN" "║        GatekeeperVPN Full Server Installation                 ║"
     print_msg "$CYAN" "║                                                                ║"
     print_msg "$CYAN" "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+    print_msg "$BLUE" "📝 Logging to: $LOG_FILE"
     echo ""
 
     check_root
@@ -524,7 +550,6 @@ main() {
     generate_config
     setup_ip_forwarding
     setup_nat
-    verify_nat
     install_systemd
     start_service
     print_summary
