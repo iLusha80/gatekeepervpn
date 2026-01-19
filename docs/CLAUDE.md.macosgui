@@ -1,0 +1,245 @@
+# CLAUDE.md
+
+Инструкции для Claude Code при работе с GatekeeperVPN macOS GUI.
+
+## Правила
+
+* Отвечай **на русском языке**
+* Используй `context7` MCP tool для проверки актуальной документации библиотек
+* Используй SwiftUI и современный  Swift (6.1.2)
+* Минимальная версия macOS: 13.0 (Ventura)
+* Архитектура: MVVM
+* Код должен быть чистым и читаемым
+
+---
+
+## Проект
+
+**GatekeeperVPN macOS** — нативное Menu Bar приложение для управления VPN.
+
+### Основные компоненты
+
+| Компонент | Описание |
+|-----------|----------|
+| `GatekeeperVPNApp.swift` | Entry point, @main |
+| `AppDelegate.swift` | NSApplicationDelegate, настройка menu bar |
+| `VPNManager.swift` | Главный ViewModel, управление подключением |
+| `VPNService.swift` | Запуск gatekeeper-client CLI |
+| `ProfileManager.swift` | CRUD операции с профилями |
+| `KeychainService.swift` | Хранение приватных ключей |
+
+### Структура папок
+
+```
+GatekeeperVPN/
+├── App/                    # Entry points
+├── Views/                  # SwiftUI views
+│   └── Components/         # Reusable components
+├── ViewModels/             # ObservableObject классы
+├── Models/                 # Data models (Codable)
+├── Services/               # Business logic
+└── Resources/              # Assets, localization
+```
+
+---
+
+## Команды сборки
+
+```bash
+# Сборка через Xcode
+xcodebuild -scheme GatekeeperVPN -configuration Debug build
+
+# Или открыть в Xcode
+open GatekeeperVPN.xcodeproj
+
+# Запуск тестов
+xcodebuild test -scheme GatekeeperVPN
+```
+
+---
+
+## Ключевые модели
+
+### Profile
+
+```swift
+struct Profile: Codable, Identifiable {
+    let id: UUID
+    var name: String
+    var serverAddress: String      // "vpn.example.com:51820"
+    var serverPublicKey: String    // base64
+    var tunAddress: String         // "10.10.10.2"
+    var tunNetmask: String         // "255.255.255.0"
+    // privateKey хранится в Keychain отдельно
+}
+```
+
+### ConnectionStatus
+
+```swift
+enum ConnectionStatus: Equatable {
+    case disconnected
+    case connecting
+    case connected(since: Date)
+    case reconnecting
+    case disconnecting
+    case error(message: String)
+}
+```
+
+---
+
+## Интеграция с CLI
+
+Приложение запускает `gatekeeper-client` как subprocess:
+
+```swift
+// VPNService.swift
+func connect(configPath: String) async throws {
+    let script = """
+        do shell script "\\(binaryPath) -c \\(configPath)" \\
+            with administrator privileges
+    """
+    // Запуск через osascript для sudo
+}
+```
+
+Бинарник `gatekeeper-client` встраивается в `Binaries/` или ищется в `/usr/local/bin/`.
+
+---
+
+## Хранение данных
+
+| Данные | Хранилище |
+|--------|-----------|
+| Приватные ключи | Keychain |
+| Профили (без ключей) | ~/Library/Application Support/GatekeeperVPN/profiles/ |
+| Настройки | @AppStorage (UserDefaults) |
+| Логи | ~/Library/Application Support/GatekeeperVPN/logs/ |
+
+---
+
+## UI Guidelines
+
+### Menu Bar Popup
+
+- Ширина: 280pt
+- Используй `MenuBarExtra` (macOS 13+)
+- Иконки: SF Symbols
+- Следуй системной теме
+
+### Состояния иконки
+
+```
+○  Disconnected (серый)
+◐  Connecting (жёлтый, анимация)
+●  Connected (зелёный/акцент)
+⊗  Error (красный)
+```
+
+### Цвета
+
+```swift
+Color.green   // Connected
+Color.yellow  // Connecting
+Color.red     // Error
+Color.secondary // Disconnected
+```
+
+---
+
+## Важные паттерны
+
+### Async/Await
+
+```swift
+// Всегда используй async/await вместо completion handlers
+func connect() async throws {
+    await MainActor.run {
+        status = .connecting
+    }
+    try await vpnService.connect(profile: currentProfile)
+}
+```
+
+### Error Handling
+
+```swift
+// Всегда показывай ошибки пользователю
+do {
+    try await connect()
+} catch {
+    status = .error(message: error.localizedDescription)
+}
+```
+
+### Observable
+
+```swift
+// Используй @Observable (macOS 14+) или ObservableObject
+@Observable
+class VPNManager {
+    var status: ConnectionStatus = .disconnected
+    var currentProfile: Profile?
+}
+```
+
+---
+
+## Чего НЕ делать
+
+- ❌ Не хранить приватные ключи в UserDefaults
+- ❌ Не использовать force unwrap (!) без проверки
+- ❌ Не блокировать main thread
+- ❌ Не игнорировать ошибки
+- ❌ Не использовать устаревшие API (AppKit когда есть SwiftUI аналог)
+
+---
+
+## Тестирование
+
+```swift
+// Используй Preview для быстрой итерации
+#Preview {
+    MenuBarView()
+        .environment(VPNManager.preview)
+}
+
+// Mock данные для preview
+extension VPNManager {
+    static var preview: VPNManager {
+        let manager = VPNManager()
+        manager.status = .connected(since: Date())
+        return manager
+    }
+}
+```
+
+---
+
+## Связанные ресурсы
+
+- [План реализации](macos-gui-plan.md)
+- [GatekeeperVPN Core](https://github.com/user/gatekeepervpn) — Rust backend
+- [Apple Human Interface Guidelines](https://developer.apple.com/design/human-interface-guidelines/the-menu-bar)
+- [SwiftUI Documentation](https://developer.apple.com/documentation/swiftui)
+
+---
+
+## Контекст: GatekeeperVPN Protocol
+
+VPN использует:
+- **Noise IK** handshake (как WireGuard)
+- **X25519** для обмена ключами
+- **ChaCha20-Poly1305** для шифрования
+- **UDP** транспорт
+
+Формат конфига клиента (TOML):
+
+```toml
+server = "vpn.example.com:51820"
+private_key = "base64..."
+server_public_key = "base64..."
+tun_address = "10.10.10.2"
+tun_netmask = "255.255.255.0"
+```
