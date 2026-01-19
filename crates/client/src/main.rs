@@ -206,10 +206,17 @@ async fn run_vpn_mode(
         .and_then(|s| s.parse().ok())
         .context("Invalid server IP in config")?;
 
+    // Calculate VPN gateway IP (usually .1 in the VPN subnet)
+    let vpn_gateway_ip = {
+        let octets = tun_address.octets();
+        Ipv4Addr::new(octets[0], octets[1], octets[2], 1)
+    };
+
     let route_config = RouteConfig {
         tun_name: tun_device.name().to_string(),
         tun_gateway: tun_address,
         server_ip,
+        vpn_gateway_ip,
         route_all_traffic: config.route_all_traffic,
         routed_subnets: config.routed_subnets.clone(),
     };

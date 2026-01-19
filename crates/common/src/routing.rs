@@ -16,6 +16,8 @@ pub struct RouteConfig {
     pub tun_gateway: Ipv4Addr,
     /// VPN server IP address (needs direct route to original gateway)
     pub server_ip: Ipv4Addr,
+    /// VPN gateway IP inside the VPN subnet (e.g., 10.10.10.1)
+    pub vpn_gateway_ip: Ipv4Addr,
     /// Whether to route all traffic through VPN
     pub route_all_traffic: bool,
     /// Specific subnets to route through VPN (if not routing all)
@@ -98,8 +100,73 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
         log::warn!("Failed to add route to VPN server (might already exist)");
     }
 
+    // 2. Add explicit host route for VPN gateway
+    // On macOS, without an explicit host route, ping to the VPN gateway IP
+    // (e.g., 10.10.10.1) might fail because the system tries to ARP resolve it
+    // instead of sending packets through the TUN interface.
+    log::info!("Adding host route for VPN gateway {} through {}",
+        config.vpn_gateway_ip, config.tun_name);
+    let status = Command::new("sudo")
+        .args([
+            "route",
+            "-n",
+            "add",
+            "-host",
+            &config.vpn_gateway_ip.to_string(),
+            "-interface",
+            &config.tun_name,
+        ])
+        .status()
+        .map_err(|e| Error::Io(e))?;
+
+    if !status.success() {
+        log::warn!("Failed to add VPN gateway host route (might already exist)");
+    }
+
+    // 3. Fix VPN subnet route
+    // The tun library automatically adds an incorrect route with a non-existent gateway
+    // (e.g., 10.10.10/24 via 10.0.0.255). We need to delete it and add a correct one.
+    let vpn_subnet = format!("{}/24",
+        config.tun_gateway.octets()[..3]
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    );
+
+    // First, delete the incorrect route added by tun library
+    log::info!("Removing incorrect VPN subnet route for {}", vpn_subnet);
+    let _ = Command::new("sudo")
+        .args([
+            "route",
+            "-n",
+            "delete",
+            "-net",
+            &vpn_subnet,
+        ])
+        .status();
+
+    // Now add the correct route through TUN interface
+    log::info!("Adding correct route for VPN subnet {} through {}", vpn_subnet, config.tun_name);
+    let status = Command::new("sudo")
+        .args([
+            "route",
+            "-n",
+            "add",
+            "-net",
+            &vpn_subnet,
+            "-interface",
+            &config.tun_name,
+        ])
+        .status()
+        .map_err(|e| Error::Io(e))?;
+
+    if !status.success() {
+        return Err(Error::Route(format!("Failed to add VPN subnet route for {}", vpn_subnet)));
+    }
+
     if config.route_all_traffic {
-        // 2. Replace default route with TUN
+        // 3. Replace default route with TUN
         // On macOS, we add more specific routes that override the default
         log::info!("Setting up full tunnel routing through {}", config.tun_name);
 
@@ -248,6 +315,29 @@ pub fn cleanup_routes(config: &RouteConfig) -> Result<(), Error> {
         ])
         .status();
 
+    // Remove VPN gateway host route
+    let _ = Command::new("sudo")
+        .args([
+            "route",
+            "-n",
+            "delete",
+            "-host",
+            &config.vpn_gateway_ip.to_string(),
+        ])
+        .status();
+
+    // Remove VPN subnet route
+    let vpn_subnet = format!("{}/24",
+        config.tun_gateway.octets()[..3]
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    );
+    let _ = Command::new("sudo")
+        .args(["route", "-n", "delete", "-net", &vpn_subnet])
+        .status();
+
     if config.route_all_traffic {
         // Remove TUN routes
         let _ = Command::new("sudo")
@@ -308,6 +398,7 @@ mod tests {
             tun_name: "utun5".to_string(),
             tun_gateway: "10.0.0.2".parse().unwrap(),
             server_ip: "1.2.3.4".parse().unwrap(),
+            vpn_gateway_ip: "10.0.0.1".parse().unwrap(),
             route_all_traffic: true,
             routed_subnets: vec![],
         };

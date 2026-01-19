@@ -1,7 +1,8 @@
 /target
 
-# Generated files
-CLAUDE.md
-IdeasToGo.md
-PlanToMVP.md
+# Ignore all .md files except README.md
+*.md
+!README.md
+
+# Other generated files
 x.txt

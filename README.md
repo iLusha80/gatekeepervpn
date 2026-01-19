@@ -12,6 +12,7 @@
 - **Автоматическая настройка NAT** — сервер автоматически включает IP forwarding и настраивает NAT
 - **Hot-reload** — изменения peers.toml применяются без перезапуска
 - **Keep-alive + автопереподключение**
+- **macOS поддержка** — автоматическое исправление маршрутов для корректной работы на macOS
 
 ## Быстрый старт
 
@@ -82,6 +83,8 @@ sudo systemctl start gatekeeper
 ```bash
 sudo gatekeeper-client -c /path/to/laptop-ilya.conf
 ```
+
+**macOS:** Клиент автоматически исправляет маршруты для корректной работы на macOS. Если видите проблемы с подключением, проверьте [секцию troubleshooting для macOS](#специфичные-проблемы-macos).
 
 **DNS:** Клиент не меняет DNS автоматически. Для работы с доменными именами:
 
@@ -168,18 +171,35 @@ tun_netmask = "255.255.255.0"
 После подключения клиента проверьте:
 
 ```bash
-# Проверить маршруты
-netstat -rn | grep utun  # macOS
-ip route | grep tun      # Linux
+# 1. Проверить VPN gateway
+ping -c 3 10.10.10.1  # должен отвечать!
 
-# Проверить доступность интернета
+# 2. Проверить маршруты
+netstat -rn | grep utun     # macOS
+ip route | grep tun         # Linux
+
+# 3. Проверить доступность интернета
 ping -c 3 8.8.8.8
+ping -c 3 google.com
 
-# Проверить внешний IP (должен быть IP сервера)
+# 4. Проверить внешний IP (должен быть IP сервера)
 curl ifconfig.me
 
-# Проверить доступ к сайтам
+# 5. Проверить доступ к сайтам
 curl -I https://google.com
+```
+
+### Ожидаемые маршруты на macOS
+
+После успешного подключения должны быть следующие маршруты:
+
+```bash
+$ netstat -rn | grep -E "(10.10.10|utun)"
+10.10.10.1         utun8              UH                  utun8       # VPN gateway
+10.10.10/24        utun8              USc                 utun8       # VPN subnet
+0.0.0.0/1          utun8              UGSc                utun8       # Default route (part 1)
+128.0.0.0/1        utun8              UGSc                utun8       # Default route (part 2)
+84.246.85.36       10.240.111.250     UGHS                en0         # Direct route to VPN server
 ```
 
 ### Диагностика проблем
@@ -243,15 +263,57 @@ ip addr | grep tun    # Linux
 netstat -rn | grep "0.0.0.0"
 ```
 
+#### Специфичные проблемы macOS
+
+**Проблема:** Ping к VPN gateway (10.10.10.1) не работает, хотя handshake успешен.
+
+**Причина:** Библиотека `tun` на macOS добавляет неправильный автоматический маршрут с несуществующим gateway (10.0.0.255).
+
+**Решение:** Клиент автоматически исправляет маршруты при подключении (начиная с версии после 2026-01-19). В логах должны быть:
+
+```
+[INFO] Removing incorrect VPN subnet route for 10.10.10/24
+[INFO] Adding host route for VPN gateway 10.10.10.1 through utun8
+[INFO] Adding correct route for VPN subnet 10.10.10/24 through utun8
+```
+
+Если проблемы остались, проверьте маршруты вручную:
+
+```bash
+# Во время работы VPN
+netstat -rn | grep 10.10.10
+
+# Должны видеть:
+# 10.10.10.1         utun8              UH      utun8     ← host route для gateway
+# 10.10.10/24        utun8              USc     utun8     ← subnet route
+```
+
+**Отладка с tcpdump:**
+
+```bash
+# В одном терминале - запустить VPN клиента
+sudo ./target/release/gatekeeper-client -c client.conf
+
+# В другом терминале - смотреть трафик на TUN
+sudo tcpdump -i utun8 -n icmp
+
+# В третьем терминале - сделать ping
+ping -c 3 10.10.10.1
+
+# В tcpdump должны появиться ICMP пакеты!
+```
+
 ## Порты и протоколы
 
 - **UDP 51820** — основной порт VPN (можно изменить)
 
 ## Требования
 
-- Linux или macOS
-- Root права (для TUN интерфейса)
-- Rust 1.75+ (для сборки)
+- **ОС:** Linux (Ubuntu/Debian) или macOS
+  - ✅ Протестировано на Ubuntu 22.04+
+  - ✅ Протестировано на macOS (с автоматическим исправлением маршрутов)
+- **Права:** Root (для создания TUN интерфейса)
+- **Сборка:** Rust 1.75+ (для компиляции из исходников)
 
 ## Безопасность
 
