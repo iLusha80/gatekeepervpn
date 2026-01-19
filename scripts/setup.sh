@@ -202,6 +202,18 @@ generate_config() {
         --tun-address "$SERVER_IP" \
         --output "$CONFIG_DIR/server.toml"
 
+    # Add external_interface and enable_nat to config
+    # These lines are added after generation since gkvpn generate-server doesn't support them yet
+    if ! grep -q "external_interface" "$CONFIG_DIR/server.toml"; then
+        echo "" >> "$CONFIG_DIR/server.toml"
+        echo "# NAT configuration" >> "$CONFIG_DIR/server.toml"
+        echo "# External network interface for internet access" >> "$CONFIG_DIR/server.toml"
+        echo "external_interface = \"$INTERFACE\"" >> "$CONFIG_DIR/server.toml"
+        echo "" >> "$CONFIG_DIR/server.toml"
+        echo "# Enable automatic NAT configuration (requires root)" >> "$CONFIG_DIR/server.toml"
+        echo "enable_nat = true" >> "$CONFIG_DIR/server.toml"
+    fi
+
     # Initialize peers
     "$INSTALL_DIR/gkvpn" --config-dir "$CONFIG_DIR" init \
         --subnet "$SUBNET" \
@@ -213,6 +225,7 @@ generate_config() {
     chmod 600 "$CONFIG_DIR/peers.toml"
 
     print_msg "$GREEN" "Configuration generated at $CONFIG_DIR/"
+    print_msg "$GREEN" "External interface: $INTERFACE (auto-detected)"
 }
 
 # Setup firewall and NAT (Linux)
