@@ -283,6 +283,12 @@ generate_config() {
     mkdir -p "$CONFIG_DIR" || error_exit "Failed to create config directory"
     mkdir -p "$CONFIG_DIR/profiles" || error_exit "Failed to create profiles directory"
 
+    # Backup old config if exists
+    if [[ -f "$CONFIG_DIR/server.toml" ]]; then
+        print_msg "$YELLOW" "Backing up existing config..."
+        mv "$CONFIG_DIR/server.toml" "$CONFIG_DIR/server.toml.backup-$(date +%Y%m%d-%H%M%S)"
+    fi
+
     # Generate server config with keys
     "$INSTALL_DIR/gkvpn" generate-server \
         --listen "0.0.0.0:$PORT" \
@@ -513,6 +519,30 @@ main() {
     echo ""
 
     check_root
+
+    # Check if already installed
+    if [[ -f "$CONFIG_DIR/server.toml" ]] || [[ -f "$SYSTEMD_DIR/gatekeeper.service" ]]; then
+        print_msg "$YELLOW" ""
+        print_msg "$YELLOW" "⚠️  WARNING: Existing installation detected!"
+        print_msg "$YELLOW" ""
+        if [[ -f "$CONFIG_DIR/server.toml" ]]; then
+            print_msg "$YELLOW" "   - Found config: $CONFIG_DIR/server.toml"
+        fi
+        if [[ -f "$SYSTEMD_DIR/gatekeeper.service" ]]; then
+            print_msg "$YELLOW" "   - Found service: $SYSTEMD_DIR/gatekeeper.service"
+        fi
+        print_msg "$YELLOW" ""
+        print_msg "$YELLOW" "   Old config will be backed up before reinstalling."
+        print_msg "$YELLOW" "   Clients (peers.toml) will NOT be deleted."
+        print_msg "$YELLOW" ""
+        read -p "Continue with reinstallation? [y/N]: " reinstall_confirm
+        if [[ ! "$reinstall_confirm" =~ ^[Yy]$ ]]; then
+            print_msg "$RED" "Installation cancelled."
+            print_msg "$YELLOW" "To manually fix configuration, run: bash scripts/fix-installation.sh"
+            exit 0
+        fi
+    fi
+
     get_interface
     configure_subnet
     configure_port
