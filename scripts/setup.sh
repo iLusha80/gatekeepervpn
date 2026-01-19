@@ -1,23 +1,26 @@
 #!/bin/bash
 #
-# GatekeeperVPN Server Setup Script
+# GatekeeperVPN Full Server Setup Script
 #
-# Interactive setup for:
-# - Building and installing binaries
-# - Generating server configuration
-# - Creating peers.toml
-# - Setting up NAT and firewall
-# - Creating systemd service
+# Полная автоматическая установка и настройка сервера на чистой системе:
+# - Установка зависимостей
+# - Сборка проекта
+# - Установка бинарников
+# - Генерация конфигурации
+# - Настройка NAT и firewall
+# - Создание systemd сервиса
+# - Запуск сервера
 #
 
 set -e
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+NC='\033[0m'
 
 # Default values
 DEFAULT_SUBNET="10.10.10.0"
@@ -27,24 +30,14 @@ CONFIG_DIR="/etc/gatekeeper"
 INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 
-# Detect OS
-detect_os() {
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if command -v apt-get &> /dev/null; then
-            echo "debian"
-        elif command -v dnf &> /dev/null; then
-            echo "fedora"
-        elif command -v yum &> /dev/null; then
-            echo "centos"
-        else
-            echo "linux"
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "macos"
-    else
-        echo "unknown"
-    fi
-}
+# Global variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+SUBNET=""
+MASK=""
+SERVER_IP=""
+PORT=""
+INTERFACE=""
 
 # Print colored message
 print_msg() {
@@ -56,143 +49,189 @@ print_msg() {
 # Print step header
 print_step() {
     echo ""
-    print_msg "$BLUE" "==> $1"
+    print_msg "$CYAN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_msg "$BLUE" "  ▶ $1"
+    print_msg "$CYAN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        print_msg "$RED" "Error: This script must be run as root"
+        print_msg "$RED" "❌ Error: This script must be run as root (use sudo)"
         exit 1
+    fi
+    print_msg "$GREEN" "✓ Running as root"
+}
+
+# Detect OS
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_NAME=$ID
+        OS_VERSION=$VERSION_ID
+    else
+        OS_NAME="unknown"
+    fi
+
+    if [[ "$OS_NAME" =~ ^(debian|ubuntu)$ ]]; then
+        PKG_MANAGER="apt-get"
+    elif [[ "$OS_NAME" =~ ^(centos|rhel|fedora)$ ]]; then
+        PKG_MANAGER="yum"
+    else
+        PKG_MANAGER="unknown"
     fi
 }
 
-# Check dependencies
-check_dependencies() {
-    print_step "Checking dependencies..."
+# Install system dependencies
+install_dependencies() {
+    print_step "Installing system dependencies"
 
-    local missing=()
+    detect_os
 
-    # Check for cargo
-    if ! command -v cargo &> /dev/null; then
-        missing+=("cargo (Rust)")
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+        print_msg "$YELLOW" "Updating package list..."
+        apt-get update -qq
+
+        print_msg "$YELLOW" "Installing required packages..."
+        apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            curl \
+            git \
+            iptables \
+            iptables-persistent \
+            netfilter-persistent
+
+        print_msg "$GREEN" "✓ System packages installed"
+
+    elif [[ "$PKG_MANAGER" == "yum" ]]; then
+        print_msg "$YELLOW" "Installing required packages..."
+        yum install -y \
+            gcc \
+            gcc-c++ \
+            make \
+            pkgconfig \
+            openssl-devel \
+            curl \
+            git \
+            iptables-services
+
+        print_msg "$GREEN" "✓ System packages installed"
+    else
+        print_msg "$YELLOW" "⚠ Unknown package manager, skipping system packages"
+    fi
+}
+
+# Install Rust
+install_rust() {
+    print_step "Checking Rust installation"
+
+    if command -v cargo &> /dev/null; then
+        RUST_VERSION=$(rustc --version | cut -d' ' -f2)
+        print_msg "$GREEN" "✓ Rust already installed: $RUST_VERSION"
+        return
     fi
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        print_msg "$RED" "Missing dependencies: ${missing[*]}"
-        print_msg "$YELLOW" "Please install them and run this script again."
+    print_msg "$YELLOW" "Installing Rust..."
+
+    # Install rustup for root user
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+    # Source cargo env
+    source "$HOME/.cargo/env"
+
+    RUST_VERSION=$(rustc --version | cut -d' ' -f2)
+    print_msg "$GREEN" "✓ Rust installed: $RUST_VERSION"
+}
+
+# Get network interface for NAT
+get_interface() {
+    print_step "Detecting network interface"
+
+    # Try to auto-detect
+    INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+    if [[ -z "$INTERFACE" ]]; then
+        print_msg "$RED" "❌ Could not auto-detect network interface"
         exit 1
     fi
 
-    print_msg "$GREEN" "All dependencies found."
+    # Verify interface exists
+    if ! ip link show "$INTERFACE" &> /dev/null; then
+        print_msg "$RED" "❌ Interface $INTERFACE not found"
+        exit 1
+    fi
+
+    # Get interface IP
+    INTERFACE_IP=$(ip -4 addr show "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+
+    print_msg "$GREEN" "✓ External interface: $INTERFACE ($INTERFACE_IP)"
 }
 
-# Select subnet interactively
-select_subnet() {
-    print_step "Select VPN subnet"
+# Configure subnet
+configure_subnet() {
+    print_step "Configuring VPN subnet"
 
-    echo ""
-    echo "Choose a subnet for your VPN:"
-    echo ""
-    echo "  1) 10.10.10.0/24  - 253 clients (recommended for small deployments)"
-    echo "  2) 10.10.0.0/16   - 65533 clients (large deployments)"
-    echo "  3) Custom subnet"
-    echo ""
-
-    read -p "Selection [1]: " choice
-    choice=${choice:-1}
-
-    case $choice in
-        1)
-            SUBNET="10.10.10.0"
-            MASK=24
-            ;;
-        2)
-            SUBNET="10.10.0.0"
-            MASK=16
-            ;;
-        3)
-            read -p "Enter subnet (e.g., 192.168.100.0): " SUBNET
-            SUBNET=${SUBNET:-$DEFAULT_SUBNET}
-            read -p "Enter mask (e.g., 24): " MASK
-            MASK=${MASK:-$DEFAULT_MASK}
-            ;;
-        *)
-            SUBNET=$DEFAULT_SUBNET
-            MASK=$DEFAULT_MASK
-            ;;
-    esac
+    # Use defaults for automated setup
+    SUBNET=$DEFAULT_SUBNET
+    MASK=$DEFAULT_MASK
 
     # Calculate server IP (first usable)
     IFS='.' read -r -a octets <<< "$SUBNET"
     SERVER_IP="${octets[0]}.${octets[1]}.${octets[2]}.$((octets[3] + 1))"
 
-    print_msg "$GREEN" "Selected: $SUBNET/$MASK (Server IP: $SERVER_IP)"
+    print_msg "$GREEN" "✓ Subnet: $SUBNET/$MASK"
+    print_msg "$GREEN" "✓ Server IP: $SERVER_IP"
 }
 
-# Get server port
-get_port() {
-    print_step "Configure server port"
+# Configure port
+configure_port() {
+    print_step "Configuring server port"
 
-    read -p "UDP port [$DEFAULT_PORT]: " PORT
-    PORT=${PORT:-$DEFAULT_PORT}
+    PORT=$DEFAULT_PORT
 
-    print_msg "$GREEN" "Using port: $PORT"
-}
-
-# Get network interface for NAT
-get_interface() {
-    print_step "Configure NAT"
-
-    # Try to detect default interface
-    if [[ $(detect_os) == "macos" ]]; then
-        DEFAULT_IF=$(route -n get default 2>/dev/null | grep interface | awk '{print $2}')
-    else
-        DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
-    fi
-
-    echo ""
-    echo "Network interface for NAT (internet-facing):"
-    read -p "Interface [$DEFAULT_IF]: " INTERFACE
-    INTERFACE=${INTERFACE:-$DEFAULT_IF}
-
-    print_msg "$GREEN" "Using interface: $INTERFACE"
+    print_msg "$GREEN" "✓ Port: $PORT/udp"
 }
 
 # Build project
 build_project() {
-    print_step "Building GatekeeperVPN..."
-
-    # Find project root (script is in scripts/)
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+    print_step "Building GatekeeperVPN from source"
 
     cd "$PROJECT_ROOT"
 
-    cargo build --release
+    # Ensure cargo is in PATH
+    export PATH="$HOME/.cargo/bin:$PATH"
 
-    print_msg "$GREEN" "Build complete."
+    print_msg "$YELLOW" "Running cargo build --release (this may take a few minutes)..."
+    cargo build --release 2>&1 | grep -E "(Compiling|Finished)" || true
+
+    if [[ ! -f "$PROJECT_ROOT/target/release/gatekeeper-server" ]]; then
+        print_msg "$RED" "❌ Build failed: gatekeeper-server binary not found"
+        exit 1
+    fi
+
+    print_msg "$GREEN" "✓ Build complete"
 }
 
 # Install binaries
 install_binaries() {
-    print_step "Installing binaries to $INSTALL_DIR..."
-
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+    print_step "Installing binaries"
 
     install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-server" "$INSTALL_DIR/"
     install -m 755 "$PROJECT_ROOT/target/release/gatekeeper-client" "$INSTALL_DIR/"
     install -m 755 "$PROJECT_ROOT/target/release/gkvpn" "$INSTALL_DIR/"
 
-    print_msg "$GREEN" "Binaries installed."
+    print_msg "$GREEN" "✓ Installed to $INSTALL_DIR/"
+    print_msg "$GREEN" "  - gatekeeper-server"
+    print_msg "$GREEN" "  - gatekeeper-client"
+    print_msg "$GREEN" "  - gkvpn"
 }
 
-# Generate server configuration
+# Generate configuration
 generate_config() {
-    print_step "Generating server configuration..."
+    print_step "Generating server configuration"
 
-    # Create config directory
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CONFIG_DIR/profiles"
 
@@ -202,17 +241,16 @@ generate_config() {
         --tun-address "$SERVER_IP" \
         --output "$CONFIG_DIR/server.toml"
 
-    # Add external_interface and enable_nat to config
-    # These lines are added after generation since gkvpn generate-server doesn't support them yet
-    if ! grep -q "external_interface" "$CONFIG_DIR/server.toml"; then
-        echo "" >> "$CONFIG_DIR/server.toml"
-        echo "# NAT configuration" >> "$CONFIG_DIR/server.toml"
-        echo "# External network interface for internet access" >> "$CONFIG_DIR/server.toml"
-        echo "external_interface = \"$INTERFACE\"" >> "$CONFIG_DIR/server.toml"
-        echo "" >> "$CONFIG_DIR/server.toml"
-        echo "# Enable automatic NAT configuration (requires root)" >> "$CONFIG_DIR/server.toml"
-        echo "enable_nat = true" >> "$CONFIG_DIR/server.toml"
-    fi
+    # Add NAT configuration
+    cat >> "$CONFIG_DIR/server.toml" << EOF
+
+# NAT configuration
+# External network interface for internet access
+external_interface = "$INTERFACE"
+
+# Enable automatic NAT configuration (requires root)
+enable_nat = true
+EOF
 
     # Initialize peers
     "$INSTALL_DIR/gkvpn" --config-dir "$CONFIG_DIR" init \
@@ -223,118 +261,123 @@ generate_config() {
     # Set permissions
     chmod 600 "$CONFIG_DIR/server.toml"
     chmod 600 "$CONFIG_DIR/peers.toml"
+    chmod 755 "$CONFIG_DIR/profiles"
 
-    print_msg "$GREEN" "Configuration generated at $CONFIG_DIR/"
-    print_msg "$GREEN" "External interface: $INTERFACE (auto-detected)"
+    print_msg "$GREEN" "✓ Configuration generated at $CONFIG_DIR/"
 }
 
-# Setup firewall and NAT (Linux)
-setup_firewall_linux() {
-    print_step "Setting up firewall and NAT..."
+# Setup IP forwarding
+setup_ip_forwarding() {
+    print_step "Enabling IP forwarding"
 
-    # Enable IP forwarding
+    # Enable immediately
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+    # Make persistent
     echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-gatekeeper.conf
-    sysctl -w net.ipv4.ip_forward=1
+
+    # Verify
+    FORWARD_STATUS=$(sysctl -n net.ipv4.ip_forward)
+    if [[ "$FORWARD_STATUS" == "1" ]]; then
+        print_msg "$GREEN" "✓ IP forwarding enabled"
+    else
+        print_msg "$RED" "❌ Failed to enable IP forwarding"
+        exit 1
+    fi
+}
+
+# Setup NAT and firewall
+setup_nat() {
+    print_step "Configuring NAT and firewall"
 
     local VPN_SUBNET="$SUBNET/$MASK"
 
-    # Check for nftables vs iptables
-    if command -v nft &> /dev/null && systemctl is-active --quiet nftables; then
-        print_msg "$YELLOW" "Using nftables..."
+    print_msg "$YELLOW" "Setting up iptables rules..."
 
-        # Create nftables rules
-        cat > /etc/nftables.d/gatekeeper.conf << EOF
-table ip gatekeeper {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr $VPN_SUBNET oifname "$INTERFACE" masquerade
-    }
-
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        ip saddr $VPN_SUBNET accept
-        ip daddr $VPN_SUBNET accept
-    }
-}
-EOF
-        nft -f /etc/nftables.d/gatekeeper.conf
-
-    else
-        print_msg "$YELLOW" "Using iptables..."
-
-        # NAT masquerading
+    # NAT: POSTROUTING (masquerade VPN traffic)
+    iptables -t nat -C POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s "$VPN_SUBNET" -o "$INTERFACE" -j MASQUERADE
 
-        # Allow forwarding
-        iptables -A FORWARD -s "$VPN_SUBNET" -j ACCEPT
-        iptables -A FORWARD -d "$VPN_SUBNET" -j ACCEPT
+    print_msg "$GREEN" "  ✓ NAT rule added: $VPN_SUBNET -> $INTERFACE"
 
-        # Save rules
-        if command -v iptables-save &> /dev/null; then
-            if [[ -d /etc/iptables ]]; then
-                iptables-save > /etc/iptables/rules.v4
-            fi
-        fi
+    # FORWARD: Allow VPN traffic forwarding
+    iptables -C FORWARD -i tun+ -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i tun+ -j ACCEPT
+
+    iptables -C FORWARD -o tun+ -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -o tun+ -j ACCEPT
+
+    print_msg "$GREEN" "  ✓ FORWARD rules added for tun interfaces"
+
+    # FORWARD: Specific interface forwarding
+    iptables -C FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i tun+ -o "$INTERFACE" -j ACCEPT
+
+    iptables -C FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$INTERFACE" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    print_msg "$GREEN" "  ✓ FORWARD rules added: tun+ <-> $INTERFACE"
+
+    # Save iptables rules
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save
+        print_msg "$GREEN" "  ✓ Rules saved via netfilter-persistent"
+    elif command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        print_msg "$GREEN" "  ✓ Rules saved to /etc/iptables/rules.v4"
     fi
 
-    # Open UDP port
-    if command -v ufw &> /dev/null; then
-        ufw allow "$PORT/udp"
-    elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-port="$PORT/udp"
-        firewall-cmd --reload
+    # Open VPN port in firewall (if ufw is active)
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "$PORT/udp" > /dev/null
+        print_msg "$GREEN" "  ✓ UFW: opened port $PORT/udp"
     fi
 
-    print_msg "$GREEN" "Firewall and NAT configured."
+    print_msg "$GREEN" "✓ NAT and firewall configured successfully"
 }
 
-# Setup firewall (macOS)
-setup_firewall_macos() {
-    print_step "Setting up NAT (macOS)..."
+# Verify NAT configuration
+verify_nat() {
+    print_step "Verifying NAT configuration"
 
     local VPN_SUBNET="$SUBNET/$MASK"
+    local ERRORS=0
 
-    # Enable IP forwarding
-    sysctl -w net.inet.ip.forwarding=1
-
-    # Create pf anchor for NAT
-    cat > /etc/pf.anchors/gatekeeper << EOF
-# GatekeeperVPN NAT rules
-nat on $INTERFACE from $VPN_SUBNET to any -> ($INTERFACE)
-pass in on utun+ all
-pass out on utun+ all
-EOF
-
-    # Add anchor to pf.conf if not present
-    if ! grep -q "gatekeeper" /etc/pf.conf; then
-        echo "nat-anchor \"gatekeeper\"" >> /etc/pf.conf
-        echo "anchor \"gatekeeper\"" >> /etc/pf.conf
-        echo "load anchor \"gatekeeper\" from \"/etc/pf.anchors/gatekeeper\"" >> /etc/pf.conf
+    # Check MASQUERADE rule
+    if iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET"; then
+        print_msg "$GREEN" "✓ NAT MASQUERADE rule present"
+    else
+        print_msg "$YELLOW" "⚠ NAT MASQUERADE rule not found (may be OK)"
+        ((ERRORS++))
     fi
 
-    # Load rules
-    pfctl -f /etc/pf.conf
-    pfctl -e 2>/dev/null || true
+    # Check FORWARD rules (tun or tun+)
+    if iptables -L FORWARD -n | grep -qE "tun\+?"; then
+        print_msg "$GREEN" "✓ FORWARD rules present"
+    else
+        print_msg "$YELLOW" "⚠ FORWARD rules not found (may be OK)"
+        ((ERRORS++))
+    fi
 
-    print_msg "$GREEN" "NAT configured (macOS)."
-    print_msg "$YELLOW" "Note: macOS NAT rules are not persistent across reboots."
-    print_msg "$YELLOW" "Add 'pfctl -f /etc/pf.conf' to a startup script."
+    # Don't fail on verification errors - just warn
+    if [[ $ERRORS -gt 0 ]]; then
+        print_msg "$YELLOW" "⚠ Some verification checks failed, but continuing anyway"
+        print_msg "$YELLOW" "  (Rules will be configured when server starts)"
+    fi
+
+    return 0
 }
 
-# Install systemd service (Linux only)
+# Create systemd service
 install_systemd() {
-    if [[ $(detect_os) == "macos" ]]; then
-        print_msg "$YELLOW" "Skipping systemd setup on macOS."
-        return
-    fi
-
-    print_step "Installing systemd service..."
+    print_step "Installing systemd service"
 
     cat > "$SYSTEMD_DIR/gatekeeper.service" << EOF
 [Unit]
 Description=GatekeeperVPN Server
 Documentation=https://github.com/your-org/gatekeepervpn
-After=network.target network-online.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -358,93 +401,136 @@ EOF
     # Reload systemd
     systemctl daemon-reload
 
-    # Enable and start service
+    # Enable service
     systemctl enable gatekeeper.service
+
+    print_msg "$GREEN" "✓ Systemd service installed and enabled"
+}
+
+# Start service
+start_service() {
+    print_step "Starting GatekeeperVPN server"
+
     systemctl start gatekeeper.service
 
-    print_msg "$GREEN" "Systemd service installed and started."
+    # Wait a moment for service to start
+    sleep 2
+
+    # Check status
+    if systemctl is-active --quiet gatekeeper.service; then
+        print_msg "$GREEN" "✓ Server started successfully"
+    else
+        print_msg "$RED" "❌ Server failed to start"
+        print_msg "$YELLOW" "Check logs with: journalctl -u gatekeeper -n 50"
+        exit 1
+    fi
 }
 
 # Print summary
 print_summary() {
-    print_step "Setup Complete!"
+    print_step "Installation Complete! 🎉"
 
     echo ""
-    echo "Configuration:"
-    echo "  Config directory: $CONFIG_DIR"
-    echo "  Server config:    $CONFIG_DIR/server.toml"
-    echo "  Peers config:     $CONFIG_DIR/peers.toml"
-    echo "  Profiles:         $CONFIG_DIR/profiles/"
-    echo ""
-    echo "Network:"
-    echo "  Subnet:     $SUBNET/$MASK"
-    echo "  Server IP:  $SERVER_IP"
-    echo "  Port:       $PORT/UDP"
-    echo ""
-    echo "Commands:"
-    echo "  Add client:     gkvpn add \"client-name\" --server-address YOUR_SERVER_IP:$PORT"
-    echo "  List clients:   gkvpn list"
-    echo "  Show profile:   gkvpn show \"client-name\""
-    echo "  Remove client:  gkvpn remove \"client-name\""
+    print_msg "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_msg "$GREEN" "  GatekeeperVPN Server is running!"
+    print_msg "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    if [[ $(detect_os) != "macos" ]]; then
-        echo "Service:"
-        echo "  Status:   systemctl status gatekeeper"
-        echo "  Logs:     journalctl -u gatekeeper -f"
-        echo "  Restart:  systemctl restart gatekeeper"
-        echo ""
-    fi
+    echo "📁 Configuration:"
+    echo "   Config directory:  $CONFIG_DIR"
+    echo "   Server config:     $CONFIG_DIR/server.toml"
+    echo "   Peers config:      $CONFIG_DIR/peers.toml"
+    echo "   Client profiles:   $CONFIG_DIR/profiles/"
+    echo ""
 
-    print_msg "$GREEN" "GatekeeperVPN is ready!"
-    print_msg "$YELLOW" "Don't forget to replace YOUR_SERVER_IP with your actual server IP when adding clients."
+    echo "🌐 Network:"
+    echo "   Server address:    $INTERFACE_IP:$PORT"
+    echo "   VPN subnet:        $SUBNET/$MASK"
+    echo "   VPN server IP:     $SERVER_IP"
+    echo "   External interface: $INTERFACE"
+    echo ""
+
+    echo "🔧 Service Management:"
+    echo "   Status:   systemctl status gatekeeper"
+    echo "   Stop:     systemctl stop gatekeeper"
+    echo "   Start:    systemctl start gatekeeper"
+    echo "   Restart:  systemctl restart gatekeeper"
+    echo "   Logs:     journalctl -u gatekeeper -f"
+    echo ""
+
+    echo "👥 Client Management:"
+    echo "   Add client:     gkvpn add \"client-name\" --server-address $INTERFACE_IP:$PORT"
+    echo "   List clients:   gkvpn list"
+    echo "   Show profile:   gkvpn show \"client-name\""
+    echo "   Remove client:  gkvpn remove \"client-name\""
+    echo ""
+
+    echo "📊 Diagnostics:"
+    echo "   Run diagnostics:  bash $SCRIPT_DIR/diagnose.sh"
+    echo ""
+
+    print_msg "$YELLOW" "⚠️  Next steps:"
+    echo "   1. Add your first client: gkvpn add \"myclient\" --server-address $INTERFACE_IP:$PORT"
+    echo "   2. Copy the client profile from: $CONFIG_DIR/profiles/myclient.conf"
+    echo "   3. Run the client: gatekeeper-client -c myclient.conf"
+    echo ""
 }
 
-# Main
+# Main installation flow
 main() {
-    print_msg "$BLUE" "========================================"
-    print_msg "$BLUE" "    GatekeeperVPN Server Setup"
-    print_msg "$BLUE" "========================================"
+    clear
+    print_msg "$CYAN" "╔════════════════════════════════════════════════════════════════╗"
+    print_msg "$CYAN" "║                                                                ║"
+    print_msg "$CYAN" "║        GatekeeperVPN Full Server Installation                 ║"
+    print_msg "$CYAN" "║                                                                ║"
+    print_msg "$CYAN" "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
 
     check_root
-    check_dependencies
-
-    OS=$(detect_os)
-    print_msg "$GREEN" "Detected OS: $OS"
-
-    select_subnet
-    get_port
     get_interface
+    configure_subnet
+    configure_port
 
     echo ""
-    print_msg "$YELLOW" "Ready to install with the following settings:"
-    echo "  Subnet:     $SUBNET/$MASK"
-    echo "  Server IP:  $SERVER_IP"
-    echo "  Port:       $PORT"
-    echo "  Interface:  $INTERFACE"
+    print_msg "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_msg "$YELLOW" "  Installation Settings"
+    print_msg "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  VPN Subnet:         $SUBNET/$MASK"
+    echo "  Server VPN IP:      $SERVER_IP"
+    echo "  Server Port:        $PORT/udp"
+    echo "  External Interface: $INTERFACE ($INTERFACE_IP)"
+    echo "  Install Directory:  $INSTALL_DIR"
+    echo "  Config Directory:   $CONFIG_DIR"
+    print_msg "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    read -p "Continue? [Y/n]: " confirm
+    read -p "Continue with installation? [Y/n]: " confirm
     confirm=${confirm:-Y}
 
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        print_msg "$RED" "Aborted."
-        exit 1
+        print_msg "$RED" "Installation cancelled."
+        exit 0
     fi
 
+    echo ""
+    print_msg "$CYAN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    print_msg "$CYAN" "  Starting installation..."
+    print_msg "$CYAN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    install_dependencies
+    install_rust
     build_project
     install_binaries
     generate_config
-
-    if [[ "$OS" == "macos" ]]; then
-        setup_firewall_macos
-    else
-        setup_firewall_linux
-    fi
-
+    setup_ip_forwarding
+    setup_nat
+    verify_nat
     install_systemd
-
+    start_service
     print_summary
+
+    print_msg "$GREEN" "✓ Installation completed successfully!"
+    echo ""
 }
 
 main "$@"
