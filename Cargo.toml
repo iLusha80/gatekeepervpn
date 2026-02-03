@@ -38,6 +38,10 @@ env_logger = "0.11"
 thiserror = "2.0"
 anyhow = "1.0"
 
+# DoS protection
+blake2 = "0.10"
+subtle = "2.6"
+
 # Network
 tun = { version = "0.8", features = ["async"] }
 socket2 = "0.5"

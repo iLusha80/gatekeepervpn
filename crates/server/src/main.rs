@@ -21,9 +21,10 @@ use tokio::time::interval;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    Error as CommonError, NatConfig, Packet, PacketType, PeersConfig, Responder, ServerConfig,
-    Transport, TunConfig, TunDevice, VpnErrorLoggers, cleanup_nat, configure_socket,
-    enable_ip_forwarding, get_destination_ip, print_nat_instructions, setup_nat,
+    CookieState, Error as CommonError, HandshakeRateLimiter, NatConfig, Packet, PacketType,
+    PeersConfig, RateLimitDecision, Responder, ServerConfig, Transport, TunConfig, TunDevice,
+    VpnErrorLoggers, cleanup_nat, configure_socket, enable_ip_forwarding, get_destination_ip,
+    print_nat_instructions, setup_nat,
 };
 
 /// Default peers file location
@@ -91,6 +92,10 @@ struct Server {
     authorized_peers: HashMap<[u8; 32], AuthorizedPeer>,
     /// Authorization enabled
     auth_enabled: bool,
+    /// Cookie state for DoS protection
+    cookie_state: CookieState,
+    /// Handshake rate limiter
+    rate_limiter: HandshakeRateLimiter,
 }
 
 impl Server {
@@ -101,6 +106,8 @@ impl Server {
             ip_to_addr: HashMap::new(),
             authorized_peers: HashMap::new(),
             auth_enabled,
+            cookie_state: CookieState::new(),
+            rate_limiter: HandshakeRateLimiter::new(),
         }
     }
 
@@ -354,23 +361,86 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
         let response = {
             let mut server = server.lock().await;
 
+            // Rotate cookie secret if needed
+            server.cookie_state.maybe_rotate();
+
             match packet.packet_type {
-                PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
-                    Ok((response, transport, peer)) => {
-                        let mut key_array = [0u8; 32];
-                        if let Some(ref p) = peer {
-                            key_array = p.public_key;
+                PacketType::HandshakeInit => {
+                    let client_ip = addr.ip();
+                    match server.rate_limiter.check(&client_ip) {
+                        RateLimitDecision::Drop => {
+                            log::debug!("[{}] Handshake dropped (per-IP rate limit)", addr);
+                            None
                         }
-                        server.register_client(addr, transport, key_array, peer);
-                        Some(response)
+                        RateLimitDecision::RequireCookie => {
+                            log::debug!("[{}] Sending cookie challenge", addr);
+                            let cookie = server.cookie_state.generate_cookie(&client_ip);
+                            server.rate_limiter.record(&client_ip);
+                            Some(Packet::cookie_reply(cookie))
+                        }
+                        RateLimitDecision::Allow => {
+                            server.rate_limiter.record(&client_ip);
+                            match server.handle_handshake(addr, &packet.payload) {
+                                Ok((response, transport, peer)) => {
+                                    let mut key_array = [0u8; 32];
+                                    if let Some(ref p) = peer {
+                                        key_array = p.public_key;
+                                    }
+                                    server.register_client(addr, transport, key_array, peer);
+                                    Some(response)
+                                }
+                                Err(e) => {
+                                    log::error!("[{}] Handshake error: {}", addr, e);
+                                    None
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        log::error!("[{}] Handshake error: {}", addr, e);
-                        None
+                }
+                PacketType::HandshakeInitCookie => {
+                    let client_ip = addr.ip();
+                    match server.rate_limiter.check(&client_ip) {
+                        RateLimitDecision::Drop => {
+                            log::debug!("[{}] Cookie handshake dropped (per-IP rate limit)", addr);
+                            None
+                        }
+                        _ => match packet.parse_cookie_and_payload() {
+                            Ok((cookie, handshake_payload)) => {
+                                if !server.cookie_state.validate_cookie(&client_ip, &cookie) {
+                                    log::warn!("[{}] Invalid cookie, rejecting", addr);
+                                    None
+                                } else {
+                                    server.rate_limiter.record(&client_ip);
+                                    match server.handle_handshake(addr, &handshake_payload) {
+                                        Ok((response, transport, peer)) => {
+                                            let mut key_array = [0u8; 32];
+                                            if let Some(ref p) = peer {
+                                                key_array = p.public_key;
+                                            }
+                                            server
+                                                .register_client(addr, transport, key_array, peer);
+                                            Some(response)
+                                        }
+                                        Err(e) => {
+                                            log::error!("[{}] Handshake error: {}", addr, e);
+                                            None
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[{}] Invalid cookie packet: {}", addr, e);
+                                None
+                            }
+                        },
                     }
-                },
+                }
                 PacketType::HandshakeResponse => {
                     log::warn!("[{}] Unexpected handshake response", addr);
+                    None
+                }
+                PacketType::CookieReply => {
+                    log::warn!("[{}] Unexpected CookieReply from client", addr);
                     None
                 }
                 PacketType::Data => {
@@ -501,7 +571,10 @@ async fn run_vpn_mode(
                 log::error!("You may need to configure NAT manually:");
                 print_nat_instructions(&tun_name, &vpn_subnet);
             } else {
-                log::info!("NAT configured successfully on interface {}", config.external_interface);
+                log::info!(
+                    "NAT configured successfully on interface {}",
+                    config.external_interface
+                );
             }
         }
     } else {
@@ -576,24 +649,98 @@ async fn run_vpn_mode(
 
             let mut server = server_rx.lock().await;
 
+            // Rotate cookie secret if needed
+            server.cookie_state.maybe_rotate();
+
             match packet.packet_type {
-                PacketType::HandshakeInit => match server.handle_handshake(addr, &packet.payload) {
-                    Ok((response, transport, peer)) => {
-                        let mut key_array = [0u8; 32];
-                        if let Some(ref p) = peer {
-                            key_array = p.public_key;
+                PacketType::HandshakeInit => {
+                    let client_ip = addr.ip();
+                    match server.rate_limiter.check(&client_ip) {
+                        RateLimitDecision::Drop => {
+                            log::debug!("[{}] Handshake dropped (per-IP rate limit)", addr);
                         }
-                        server.register_client(addr, transport, key_array, peer);
-                        if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
-                            log::error!("[{}] Failed to send handshake response: {}", addr, e);
+                        RateLimitDecision::RequireCookie => {
+                            log::debug!("[{}] Sending cookie challenge", addr);
+                            let cookie = server.cookie_state.generate_cookie(&client_ip);
+                            server.rate_limiter.record(&client_ip);
+                            let reply = Packet::cookie_reply(cookie);
+                            if let Err(e) = socket_rx.send_to(&reply.encode(), addr).await {
+                                log::error!("[{}] Failed to send cookie reply: {}", addr, e);
+                            }
+                        }
+                        RateLimitDecision::Allow => {
+                            server.rate_limiter.record(&client_ip);
+                            match server.handle_handshake(addr, &packet.payload) {
+                                Ok((response, transport, peer)) => {
+                                    let mut key_array = [0u8; 32];
+                                    if let Some(ref p) = peer {
+                                        key_array = p.public_key;
+                                    }
+                                    server.register_client(addr, transport, key_array, peer);
+                                    if let Err(e) =
+                                        socket_rx.send_to(&response.encode(), addr).await
+                                    {
+                                        log::error!(
+                                            "[{}] Failed to send handshake response: {}",
+                                            addr,
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("[{}] Handshake error: {}", addr, e);
+                                }
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::error!("[{}] Handshake error: {}", addr, e);
+                }
+                PacketType::HandshakeInitCookie => {
+                    let client_ip = addr.ip();
+                    match server.rate_limiter.check(&client_ip) {
+                        RateLimitDecision::Drop => {
+                            log::debug!("[{}] Cookie handshake dropped (per-IP rate limit)", addr);
+                        }
+                        _ => match packet.parse_cookie_and_payload() {
+                            Ok((cookie, handshake_payload)) => {
+                                if !server.cookie_state.validate_cookie(&client_ip, &cookie) {
+                                    log::warn!("[{}] Invalid cookie, rejecting", addr);
+                                } else {
+                                    server.rate_limiter.record(&client_ip);
+                                    match server.handle_handshake(addr, &handshake_payload) {
+                                        Ok((response, transport, peer)) => {
+                                            let mut key_array = [0u8; 32];
+                                            if let Some(ref p) = peer {
+                                                key_array = p.public_key;
+                                            }
+                                            server
+                                                .register_client(addr, transport, key_array, peer);
+                                            if let Err(e) =
+                                                socket_rx.send_to(&response.encode(), addr).await
+                                            {
+                                                log::error!(
+                                                    "[{}] Failed to send handshake response: {}",
+                                                    addr,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!("[{}] Handshake error: {}", addr, e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[{}] Invalid cookie packet: {}", addr, e);
+                            }
+                        },
                     }
-                },
+                }
                 PacketType::HandshakeResponse => {
                     log::warn!("[{}] Unexpected handshake response", addr);
+                }
+                PacketType::CookieReply => {
+                    log::warn!("[{}] Unexpected CookieReply from client", addr);
                 }
                 PacketType::Data => {
                     if let Some(client) = server.clients_by_addr.get_mut(&addr) {
@@ -728,10 +875,7 @@ async fn run_vpn_mode(
     }
 
     let client_count = server_cleanup.lock().await.clients_by_addr.len();
-    log::info!(
-        "Server stopped. {} client(s) were connected.",
-        client_count
-    );
+    log::info!("Server stopped. {} client(s) were connected.", client_count);
 
     Ok(())
 }

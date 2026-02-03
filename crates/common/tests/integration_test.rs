@@ -240,8 +240,5 @@ async fn test_replay_protection() {
 
     // Server decrypts same ciphertext again — should be rejected as replay
     let result = server_transport.decrypt(&encrypted);
-    assert!(
-        result.is_err(),
-        "Replayed packet should be rejected"
-    );
+    assert!(result.is_err(), "Replayed packet should be rejected");
 }

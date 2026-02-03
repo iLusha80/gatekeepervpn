@@ -26,6 +26,10 @@ pub enum PacketType {
     KeepAlive = 4,
     /// Keep-alive pong (server -> client)
     KeepAliveAck = 5,
+    /// Cookie reply (server -> client, DoS protection)
+    CookieReply = 6,
+    /// Handshake init with cookie (client -> server, DoS protection)
+    HandshakeInitCookie = 7,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -38,6 +42,8 @@ impl TryFrom<u8> for PacketType {
             3 => Ok(PacketType::Data),
             4 => Ok(PacketType::KeepAlive),
             5 => Ok(PacketType::KeepAliveAck),
+            6 => Ok(PacketType::CookieReply),
+            7 => Ok(PacketType::HandshakeInitCookie),
             _ => Err(Error::InvalidPacket),
         }
     }
@@ -82,6 +88,31 @@ impl Packet {
     /// Create keep-alive acknowledgment packet
     pub fn keep_alive_ack() -> Self {
         Self::new(PacketType::KeepAliveAck, Bytes::new())
+    }
+
+    /// Create cookie reply packet (server -> client)
+    pub fn cookie_reply(cookie: [u8; 32]) -> Self {
+        Self::new(PacketType::CookieReply, cookie.to_vec())
+    }
+
+    /// Create handshake init with cookie packet (client -> server)
+    pub fn handshake_init_cookie(cookie: [u8; 32], handshake_payload: impl Into<Bytes>) -> Self {
+        let payload: Bytes = handshake_payload.into();
+        let mut buf = BytesMut::with_capacity(32 + payload.len());
+        buf.put_slice(&cookie);
+        buf.put_slice(&payload);
+        Self::new(PacketType::HandshakeInitCookie, buf.freeze())
+    }
+
+    /// Parse cookie from HandshakeInitCookie payload
+    pub fn parse_cookie_and_payload(&self) -> Result<([u8; 32], Bytes), Error> {
+        if self.payload.len() < 32 {
+            return Err(Error::InvalidPacket);
+        }
+        let mut cookie = [0u8; 32];
+        cookie.copy_from_slice(&self.payload[..32]);
+        let handshake_payload = self.payload.slice(32..);
+        Ok((cookie, handshake_payload))
     }
 
     /// Encode packet to bytes
@@ -173,19 +204,52 @@ mod tests {
 
     #[test]
     fn test_all_packet_types_roundtrip() {
+        let cookie = [42u8; 32];
         let packets = vec![
             Packet::handshake_init(vec![1, 2, 3]),
             Packet::handshake_response(vec![4, 5, 6]),
             Packet::data(vec![7, 8, 9]),
             Packet::keep_alive(),
             Packet::keep_alive_ack(),
+            Packet::cookie_reply(cookie),
+            Packet::handshake_init_cookie(cookie, vec![10, 11, 12]),
         ];
 
         for original in packets {
             let ptype = original.packet_type;
             let encoded = original.encode();
             let decoded = Packet::decode(encoded).unwrap();
-            assert_eq!(decoded.packet_type, ptype, "Roundtrip failed for {:?}", ptype);
+            assert_eq!(
+                decoded.packet_type, ptype,
+                "Roundtrip failed for {:?}",
+                ptype
+            );
         }
+    }
+
+    #[test]
+    fn test_cookie_reply_roundtrip() {
+        let cookie = [0xAB; 32];
+        let packet = Packet::cookie_reply(cookie);
+        let encoded = packet.encode();
+        let decoded = Packet::decode(encoded).unwrap();
+
+        assert_eq!(decoded.packet_type, PacketType::CookieReply);
+        assert_eq!(decoded.payload.len(), 32);
+        assert_eq!(&decoded.payload[..], &cookie[..]);
+    }
+
+    #[test]
+    fn test_handshake_init_cookie_roundtrip() {
+        let cookie = [0xCD; 32];
+        let handshake_data = vec![1, 2, 3, 4, 5];
+        let packet = Packet::handshake_init_cookie(cookie, handshake_data.clone());
+        let encoded = packet.encode();
+        let decoded = Packet::decode(encoded).unwrap();
+
+        assert_eq!(decoded.packet_type, PacketType::HandshakeInitCookie);
+        let (parsed_cookie, parsed_payload) = decoded.parse_cookie_and_payload().unwrap();
+        assert_eq!(parsed_cookie, cookie);
+        assert_eq!(&parsed_payload[..], &handshake_data[..]);
     }
 }

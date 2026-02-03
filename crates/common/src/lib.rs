@@ -1,4 +1,5 @@
 pub mod config;
+pub mod cookie;
 pub mod crypto;
 pub mod error;
 pub mod handshake;
@@ -12,6 +13,7 @@ pub mod socket;
 pub mod tun_device;
 
 pub use config::{ClientConfig, PeerConfig, PeersConfig, ServerConfig};
+pub use cookie::{CookieState, HandshakeRateLimiter, RateLimitDecision};
 pub use error::Error;
 pub use handshake::{Initiator, Responder, Transport};
 pub use ip_parser::{get_destination_ip, get_source_ip, get_src_dst_ips, is_ipv4};

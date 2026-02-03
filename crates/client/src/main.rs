@@ -99,17 +99,41 @@ async fn perform_handshake(
     let init_msg = initiator
         .write_message(&[])
         .context("Failed to create handshake init")?;
-    let init_packet = Packet::handshake_init(init_msg);
+    let init_packet = Packet::handshake_init(init_msg.clone());
 
     socket
         .send(&init_packet.encode())
         .await
         .context("Failed to send handshake init")?;
 
-    // Receive handshake response
+    // Receive response (may be HandshakeResponse or CookieReply)
     let response_packet = recv_packet(socket, HANDSHAKE_TIMEOUT)
         .await
         .context("Failed to receive handshake response")?;
+
+    let response_packet = if response_packet.packet_type == PacketType::CookieReply {
+        // Server requested cookie challenge — resend with cookie
+        if response_packet.payload.len() != 32 {
+            anyhow::bail!("Invalid CookieReply payload size");
+        }
+        let mut cookie = [0u8; 32];
+        cookie.copy_from_slice(&response_packet.payload);
+
+        log::info!("Server requested cookie challenge, resending with cookie...");
+
+        let cookie_packet = Packet::handshake_init_cookie(cookie, init_msg);
+        socket
+            .send(&cookie_packet.encode())
+            .await
+            .context("Failed to send handshake init with cookie")?;
+
+        // Wait for actual HandshakeResponse
+        recv_packet(socket, HANDSHAKE_TIMEOUT)
+            .await
+            .context("Failed to receive handshake response after cookie")?
+    } else {
+        response_packet
+    };
 
     if response_packet.packet_type != PacketType::HandshakeResponse {
         anyhow::bail!(

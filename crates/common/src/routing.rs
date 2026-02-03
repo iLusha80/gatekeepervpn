@@ -104,8 +104,11 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
     // On macOS, without an explicit host route, ping to the VPN gateway IP
     // (e.g., 10.10.10.1) might fail because the system tries to ARP resolve it
     // instead of sending packets through the TUN interface.
-    log::info!("Adding host route for VPN gateway {} through {}",
-        config.vpn_gateway_ip, config.tun_name);
+    log::info!(
+        "Adding host route for VPN gateway {} through {}",
+        config.vpn_gateway_ip,
+        config.tun_name
+    );
     let status = Command::new("sudo")
         .args([
             "route",
@@ -126,7 +129,8 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
     // 3. Fix VPN subnet route
     // The tun library automatically adds an incorrect route with a non-existent gateway
     // (e.g., 10.10.10/24 via 10.0.0.255). We need to delete it and add a correct one.
-    let vpn_subnet = format!("{}/24",
+    let vpn_subnet = format!(
+        "{}/24",
         config.tun_gateway.octets()[..3]
             .iter()
             .map(|o| o.to_string())
@@ -137,17 +141,15 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
     // First, delete the incorrect route added by tun library
     log::info!("Removing incorrect VPN subnet route for {}", vpn_subnet);
     let _ = Command::new("sudo")
-        .args([
-            "route",
-            "-n",
-            "delete",
-            "-net",
-            &vpn_subnet,
-        ])
+        .args(["route", "-n", "delete", "-net", &vpn_subnet])
         .status();
 
     // Now add the correct route through TUN interface
-    log::info!("Adding correct route for VPN subnet {} through {}", vpn_subnet, config.tun_name);
+    log::info!(
+        "Adding correct route for VPN subnet {} through {}",
+        vpn_subnet,
+        config.tun_name
+    );
     let status = Command::new("sudo")
         .args([
             "route",
@@ -162,7 +164,10 @@ pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {
         .map_err(|e| Error::Io(e))?;
 
     if !status.success() {
-        return Err(Error::Route(format!("Failed to add VPN subnet route for {}", vpn_subnet)));
+        return Err(Error::Route(format!(
+            "Failed to add VPN subnet route for {}",
+            vpn_subnet
+        )));
     }
 
     if config.route_all_traffic {
@@ -327,7 +332,8 @@ pub fn cleanup_routes(config: &RouteConfig) -> Result<(), Error> {
         .status();
 
     // Remove VPN subnet route
-    let vpn_subnet = format!("{}/24",
+    let vpn_subnet = format!(
+        "{}/24",
         config.tun_gateway.octets()[..3]
             .iter()
             .map(|o| o.to_string())

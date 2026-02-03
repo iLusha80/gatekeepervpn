@@ -617,6 +617,7 @@ name = "gatekeeper-common"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake2",
  "bytes",
  "chrono",
  "log",
@@ -624,6 +625,7 @@ dependencies = [
  "serde",
  "snow",
  "socket2 0.5.10",
+ "subtle",
  "thiserror",
  "tokio",
  "toml",
