@@ -22,8 +22,8 @@ use tokio::time::interval;
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
     Error as CommonError, NatConfig, Packet, PacketType, PeersConfig, Responder, ServerConfig,
-    Transport, TunConfig, TunDevice, VpnErrorLoggers, configure_socket, enable_ip_forwarding,
-    get_destination_ip, print_nat_instructions, setup_nat,
+    Transport, TunConfig, TunDevice, VpnErrorLoggers, cleanup_nat, configure_socket,
+    enable_ip_forwarding, get_destination_ip, print_nat_instructions, setup_nat,
 };
 
 /// Default peers file location
@@ -276,6 +276,27 @@ impl Server {
     }
 }
 
+/// Wait for shutdown signal (SIGINT or SIGTERM)
+async fn shutdown_signal() {
+    let ctrl_c = signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => log::info!("Received SIGINT (Ctrl+C)"),
+            _ = sigterm.recv() => log::info!("Received SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        log::info!("Received shutdown signal");
+    }
+}
+
 fn load_config(path: &str) -> Result<ServerConfig> {
     if Path::new(path).exists() {
         let content = std::fs::read_to_string(path)
@@ -315,8 +336,7 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
         // Wait for packet or shutdown signal
         let (len, addr) = tokio::select! {
             result = socket.recv_from(&mut buf) => result?,
-            _ = signal::ctrl_c() => {
-                log::info!("Received shutdown signal (Ctrl+C)");
+            _ = shutdown_signal() => {
                 log::info!("Server shutting down...");
                 return Ok(());
             }
@@ -448,7 +468,8 @@ async fn run_vpn_mode(
         .await
         .context("Failed to create TUN device. Are you running as root?")?;
 
-    log::info!("VPN server TUN interface: {}", tun_device.name());
+    let tun_name = tun_device.name().to_string();
+    log::info!("VPN server TUN interface: {}", tun_name);
 
     // Setup NAT if enabled
     let subnet = config
@@ -466,11 +487,11 @@ async fn run_vpn_mode(
         if let Err(e) = enable_ip_forwarding() {
             log::error!("Failed to enable IP forwarding: {}", e);
             log::error!("NAT will not work without IP forwarding!");
-            print_nat_instructions(tun_device.name(), &vpn_subnet);
+            print_nat_instructions(&tun_name, &vpn_subnet);
         } else {
             // Setup NAT rules
             let nat_config = NatConfig {
-                tun_interface: tun_device.name().to_string(),
+                tun_interface: tun_name.clone(),
                 external_interface: config.external_interface.clone(),
                 vpn_subnet: vpn_subnet.clone(),
             };
@@ -478,7 +499,7 @@ async fn run_vpn_mode(
             if let Err(e) = setup_nat(&nat_config) {
                 log::error!("Failed to setup NAT: {}", e);
                 log::error!("You may need to configure NAT manually:");
-                print_nat_instructions(tun_device.name(), &vpn_subnet);
+                print_nat_instructions(&tun_name, &vpn_subnet);
             } else {
                 log::info!("NAT configured successfully on interface {}", config.external_interface);
             }
@@ -486,7 +507,7 @@ async fn run_vpn_mode(
     } else {
         log::warn!("NAT configuration disabled (enable_nat = false)");
         log::warn!("Clients will not have internet access unless you configure NAT manually:");
-        print_nat_instructions(tun_device.name(), &vpn_subnet);
+        print_nat_instructions(&tun_name, &vpn_subnet);
     }
 
     let (mut tun_reader, mut tun_writer) = tun_device.split();
@@ -498,6 +519,7 @@ async fn run_vpn_mode(
     let socket_rx = socket;
     let server_tx = server.clone();
     let server_rx = server.clone();
+    let server_cleanup = server.clone();
     let server_reload = server;
     let loggers_rx = error_loggers.clone();
     let loggers_tx = error_loggers;
@@ -677,15 +699,39 @@ async fn run_vpn_mode(
         }
     });
 
+    // Build NAT config for cleanup
+    let nat_config = if config.enable_nat {
+        Some(NatConfig {
+            tun_interface: tun_name.clone(),
+            external_interface: config.external_interface.clone(),
+            vpn_subnet: vpn_subnet.clone(),
+        })
+    } else {
+        None
+    };
+
     tokio::select! {
         _ = udp_to_tun => log::error!("UDP->TUN task finished unexpectedly"),
         _ = tun_to_udp => log::error!("TUN->UDP task finished unexpectedly"),
         _ = peers_watcher => log::error!("Peers watcher task finished unexpectedly"),
-        _ = signal::ctrl_c() => {
-            log::info!("Received shutdown signal (Ctrl+C)");
+        _ = shutdown_signal() => {
             log::info!("Server shutting down...");
         }
     }
+
+    // Cleanup NAT rules
+    if let Some(ref nat_cfg) = nat_config {
+        log::info!("Cleaning up NAT rules...");
+        if let Err(e) = cleanup_nat(nat_cfg) {
+            log::error!("Failed to cleanup NAT: {}", e);
+        }
+    }
+
+    let client_count = server_cleanup.lock().await.clients_by_addr.len();
+    log::info!(
+        "Server stopped. {} client(s) were connected.",
+        client_count
+    );
 
     Ok(())
 }

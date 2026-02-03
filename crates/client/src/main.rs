@@ -41,6 +41,27 @@ struct Args {
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Wait for shutdown signal (SIGINT or SIGTERM)
+async fn shutdown_signal() {
+    let ctrl_c = signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => log::info!("Received SIGINT (Ctrl+C)"),
+            _ = sigterm.recv() => log::info!("Received SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        log::info!("Received shutdown signal");
+    }
+}
+
 fn load_config(path: &str) -> Result<ClientConfig> {
     if Path::new(path).exists() {
         let content = std::fs::read_to_string(path)
@@ -398,9 +419,7 @@ async fn run_vpn_mode(
         _ = outgoing => log::error!("Outgoing task finished unexpectedly"),
         _ = incoming => log::error!("Incoming task finished unexpectedly"),
         _ = keepalive => log::error!("Keep-alive task finished (connection timeout)"),
-        _ = signal::ctrl_c() => {
-            log::info!("Received shutdown signal (Ctrl+C)");
-        }
+        _ = shutdown_signal() => {}
     }
 
     // Cleanup routes

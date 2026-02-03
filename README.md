@@ -4,52 +4,96 @@
 
 ## Возможности
 
-- **Noise IK handshake** — безопасное установление соединения
-- **ChaCha20-Poly1305** — быстрое шифрование
-- **Per-client IP** — каждый клиент получает уникальный IP
-- **Авторизация** — только клиенты из белого списка
+- **Noise IK handshake** — безопасное установление соединения с forward secrecy
+- **ChaCha20-Poly1305** — быстрое AEAD-шифрование
+- **X25519** — эллиптический обмен ключами (128-bit equivalent security)
+- **Replay protection** — защита от повторных пакетов (SlidingWindow 2048 бит)
+- **Per-client IP** — каждый клиент получает уникальный IP из пула
+- **Авторизация** — только клиенты из белого списка (peers.toml)
 - **Unicast роутинг** — трафик идёт только нужному клиенту
 - **Автоматическая настройка NAT** — сервер автоматически включает IP forwarding и настраивает NAT
-- **Hot-reload** — изменения peers.toml применяются без перезапуска
-- **Keep-alive + автопереподключение**
-- **macOS поддержка** — автоматическое исправление маршрутов для корректной работы на macOS
+- **Hot-reload** — изменения peers.toml применяются без перезапуска сервера
+- **Keep-alive + автопереподключение** — клиент восстанавливает соединение при обрыве
+- **Graceful shutdown** — корректная очистка маршрутов и NAT-правил при остановке (SIGINT/SIGTERM)
+- **macOS + Linux** — поддержка обеих платформ с автоматическим исправлением маршрутов на macOS
+
+## Архитектура
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Client                              Server                     │
+│                                                                │
+│ TUN read → encrypt → UDP send  →  UDP recv → decrypt → TUN    │
+│ TUN write ← decrypt ← UDP recv ←  TUN read → encrypt → UDP   │
+│                                                                │
+│ Handshake: Noise IK (e, es, s, ss) → (e, ee, se)             │
+│ Transport: ChaCha20-Poly1305 + 8-byte counter                  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Структура проекта
+
+```
+crates/
+├── common/     # Общая библиотека: криптография, протокол, TUN, маршрутизация, NAT
+├── server/     # VPN-сервер
+├── client/     # VPN-клиент
+└── keygen/     # CLI-утилита управления ключами и пирами (gkvpn)
+```
+
+## Сборка
+
+**Требования:** Rust 1.75+
+
+```bash
+# Debug-сборка
+cargo build
+
+# Release-сборка (рекомендуется для деплоя)
+cargo build --release
+
+# Запуск тестов
+cargo test
+
+# Форматирование + линтер
+cargo fmt && cargo clippy
+```
+
+Собранные бинарники находятся в `target/release/`:
+- `gatekeeper-server` — сервер
+- `gatekeeper-client` — клиент
+- `gkvpn` — CLI для управления ключами и пирами
 
 ## Быстрый старт
 
-### 🚀 Автоматическая установка сервера (рекомендуется)
+### Автоматическая установка сервера (рекомендуется)
 
 ```bash
 # На чистом сервере Ubuntu/Debian
 cd /opt
-git clone https://github.com/your-username/gatekeepervpn.git
+git clone https://github.com/ArkMaster123/gatekeepervpn.git
 cd gatekeepervpn
 sudo bash scripts/setup.sh
 ```
 
-**Скрипт автоматически настроит:**
-- ✅ Установку всех зависимостей
-- ✅ Сборку проекта
-- ✅ Конфигурацию с правильным external_interface
-- ✅ NAT и IP forwarding
-- ✅ Systemd сервис
+Скрипт автоматически настроит:
+- Установку всех зависимостей (Rust, build-essential)
+- Сборку проекта в release-режиме
+- Генерацию ключей и конфигурации
+- NAT и IP forwarding
+- Systemd-сервис
 
-**Время установки:** 5-10 минут.
-
-📖 **Подробные инструкции:**
-- [QUICKSTART.md](QUICKSTART.md) - Быстрый старт за 5 минут
-- [INSTALL.md](INSTALL.md) - Полная пошаговая инструкция
-
-### Сборка вручную
-
-```bash
-cargo build --release
-```
+Подробнее: [QUICKSTART.md](QUICKSTART.md), [INSTALL.md](INSTALL.md)
 
 ### Ручная настройка
 
 #### 1. Генерация конфигурации сервера
 
 ```bash
+# Создать каталог конфигурации
+sudo mkdir -p /etc/gatekeeper
+
+# Сгенерировать серверный конфиг с ключами
 gkvpn generate-server --output /etc/gatekeeper/server.toml
 ```
 
@@ -70,54 +114,115 @@ gkvpn add "laptop-ilya" --server-address vpn.example.com:51820
 #### 4. Запуск сервера
 
 ```bash
+# Напрямую (требует root для TUN)
 sudo gatekeeper-server -c /etc/gatekeeper/server.toml -p /etc/gatekeeper/peers.toml
+
+# Через systemd
+sudo systemctl start gatekeeper
+sudo systemctl enable gatekeeper   # автозапуск при перезагрузке
 ```
 
-Или через systemd:
+#### 5. Запуск клиента
+
 ```bash
-sudo systemctl start gatekeeper
+# Скопировать профиль с сервера
+scp root@server:/etc/gatekeeper/profiles/laptop-ilya.conf ~/
+
+# Запустить клиент
+sudo gatekeeper-client -c ~/laptop-ilya.conf
 ```
+
+## Запуск
+
+### Сервер
+
+```bash
+# Полный запуск с авторизацией
+sudo gatekeeper-server -c server.toml -p peers.toml
+
+# Без авторизации (для тестирования)
+sudo gatekeeper-server -c server.toml --no-auth
+
+# Echo-режим — без TUN, просто отвечает зеркально (для тестирования)
+cargo run --bin server -- --echo
+
+# Указать адрес прослушивания
+sudo gatekeeper-server -c server.toml -l 0.0.0.0:51821
+```
+
+**Параметры сервера:**
+
+| Флаг | Описание |
+|------|----------|
+| `-c, --config` | Путь к файлу конфигурации (по умолчанию `server.toml`) |
+| `-p, --peers` | Путь к файлу пиров (по умолчанию `/etc/gatekeeper/peers.toml`) |
+| `-l, --listen` | Адрес прослушивания (переопределяет config) |
+| `-e, --echo` | Echo-режим без TUN (для тестов) |
+| `--no-auth` | Отключить авторизацию по ключам |
 
 ### Клиент
 
 ```bash
-sudo gatekeeper-client -c /path/to/laptop-ilya.conf
+# Полный запуск
+sudo gatekeeper-client -c client.conf
+
+# Указать сервер вручную (переопределяет config)
+sudo gatekeeper-client -c client.conf -s vpn.example.com:51820
+
+# Тестовый режим — handshake + echo-сообщение, без TUN
+cargo run --bin client -- --test -c client.conf
+
+# Тестовый режим с кастомным сообщением
+cargo run --bin client -- --test -m "ping" -c client.conf
 ```
 
-**macOS:** Клиент автоматически исправляет маршруты для корректной работы на macOS. Если видите проблемы с подключением, проверьте [секцию troubleshooting для macOS](#специфичные-проблемы-macos).
+**Параметры клиента:**
 
-**DNS:** Клиент не меняет DNS автоматически. Для работы с доменными именами:
+| Флаг | Описание |
+|------|----------|
+| `-c, --config` | Путь к файлу конфигурации (по умолчанию `client.toml`) |
+| `-s, --server` | Адрес сервера (переопределяет config) |
+| `-t, --test` | Тестовый режим: handshake + echo, без TUN |
+| `-m, --message` | Сообщение для test mode |
+
+### Генерация ключей (gkvpn)
 
 ```bash
-# macOS
-sudo networksetup -setdnsservers "Wi-Fi" 8.8.8.8 1.1.1.1
-
-# Linux (добавить в /etc/resolv.conf)
-nameserver 8.8.8.8
-nameserver 1.1.1.1
+gkvpn generate-server         # Сгенерировать конфиг сервера с ключами
+gkvpn generate-client          # Сгенерировать конфиг клиента
+gkvpn show-public --key "..."  # Показать публичный ключ из приватного
+gkvpn init                     # Инициализация peers.toml
+gkvpn add "name"               # Добавить клиента с авто-выделением IP
+gkvpn remove "name"            # Удалить клиента
+gkvpn list                     # Список всех клиентов
+gkvpn show "name"              # Показать профиль клиента
 ```
 
-## CLI (gkvpn)
+## Graceful Shutdown
+
+Сервер и клиент корректно обрабатывают сигналы завершения:
+
+| Сигнал | Действие |
+|--------|----------|
+| `SIGINT` (Ctrl+C) | Graceful shutdown |
+| `SIGTERM` | Graceful shutdown (systemd, docker) |
+
+**При остановке сервера:**
+- Удаляются NAT-правила (iptables/pf)
+- Логируется количество подключённых клиентов
+
+**При остановке клиента:**
+- Удаляются VPN-маршруты
+- Восстанавливается оригинальный default gateway
+- Удаляется маршрут к серверу через оригинальный gateway
 
 ```bash
-gkvpn init                    # Инициализация peers.toml
-gkvpn add "name"              # Добавить клиента
-gkvpn remove "name"           # Удалить клиента
-gkvpn list                    # Список клиентов
-gkvpn show "name"             # Показать профиль клиента
-gkvpn generate-server         # Сгенерировать конфиг сервера
-gkvpn show-public --key "..." # Показать публичный ключ
-```
+# Корректная остановка через systemd
+sudo systemctl stop gatekeeper
 
-## Структура файлов
-
-```
-/etc/gatekeeper/
-├── server.toml      # Конфигурация сервера
-├── peers.toml       # База клиентов (сервер следит за изменениями)
-└── profiles/        # Готовые конфиги для клиентов
-    ├── laptop.conf
-    └── phone.conf
+# Или Ctrl+C в терминале
+# Или kill (SIGTERM)
+sudo kill $(pgrep gatekeeper-server)
 ```
 
 ## Конфигурация
@@ -138,9 +243,11 @@ external_interface = "eth0"  # Внешний интерфейс (eth0, ens3, en
 enable_nat = true             # Автоматическая настройка NAT
 ```
 
-**Важно:** Укажите правильный внешний сетевой интерфейс для вашего сервера:
-- Узнать интерфейсы: `ip link show` (Linux) или `ifconfig` (macOS)
-- Обычно это: `eth0`, `ens3`, `ens5` на Linux; `en0` на macOS
+**Важно:** Укажите правильный внешний сетевой интерфейс:
+```bash
+ip route show default   # Linux — покажет интерфейс
+ifconfig                # macOS — обычно en0
+```
 
 ### peers.toml
 
@@ -164,15 +271,51 @@ private_key = "base64..."
 server_public_key = "base64..."
 tun_address = "10.10.10.2"
 tun_netmask = "255.255.255.0"
+tun_mtu = 1400
+
+# Маршрутизация
+route_all_traffic = true           # Весь трафик через VPN
+# routed_subnets = ["10.10.0.0/16"] # Или только указанные подсети
+
+# Keep-alive
+keepalive_interval = 25   # секунд
+keepalive_timeout = 60    # секунд до признания обрыва
+
+# Переподключение
+reconnect_enabled = true
+reconnect_delay = 5                # секунд между попытками
+max_reconnect_attempts = 0         # 0 = безлимитно
+```
+
+### Структура файлов
+
+```
+/etc/gatekeeper/
+├── server.toml      # Конфигурация сервера
+├── peers.toml       # База клиентов (сервер hot-reload каждые 5 сек)
+└── profiles/        # Готовые конфиги для клиентов
+    ├── laptop.conf
+    └── phone.conf
+```
+
+## DNS
+
+Клиент не меняет DNS автоматически. Настройте вручную:
+
+```bash
+# macOS
+sudo networksetup -setdnsservers "Wi-Fi" 8.8.8.8 1.1.1.1
+
+# Linux (добавить в /etc/resolv.conf)
+nameserver 8.8.8.8
+nameserver 1.1.1.1
 ```
 
 ## Проверка работы VPN
 
-После подключения клиента проверьте:
-
 ```bash
 # 1. Проверить VPN gateway
-ping -c 3 10.10.10.1  # должен отвечать!
+ping -c 3 10.10.10.1
 
 # 2. Проверить маршруты
 netstat -rn | grep utun     # macOS
@@ -180,148 +323,105 @@ ip route | grep tun         # Linux
 
 # 3. Проверить доступность интернета
 ping -c 3 8.8.8.8
-ping -c 3 google.com
+curl -I https://google.com
 
 # 4. Проверить внешний IP (должен быть IP сервера)
 curl ifconfig.me
-
-# 5. Проверить доступ к сайтам
-curl -I https://google.com
 ```
 
 ### Ожидаемые маршруты на macOS
 
-После успешного подключения должны быть следующие маршруты:
-
-```bash
-$ netstat -rn | grep -E "(10.10.10|utun)"
-10.10.10.1         utun8              UH                  utun8       # VPN gateway
-10.10.10/24        utun8              USc                 utun8       # VPN subnet
-0.0.0.0/1          utun8              UGSc                utun8       # Default route (part 1)
-128.0.0.0/1        utun8              UGSc                utun8       # Default route (part 2)
-84.246.85.36       10.240.111.250     UGHS                en0         # Direct route to VPN server
+```
+10.10.10.1         utun8              UH      utun8     # VPN gateway
+10.10.10/24        utun8              USc     utun8     # VPN subnet
+0.0.0.0/1          utun8              UGSc    utun8     # Default route (part 1)
+128.0.0.0/1        utun8              UGSc    utun8     # Default route (part 2)
+84.246.85.36       10.240.111.250     UGHS    en0       # Direct route to VPN server
 ```
 
-### Диагностика проблем
+## Диагностика проблем
 
-#### Автоматическая диагностика (сервер)
-
-Запустите скрипт диагностики на сервере:
+### Автоматическая диагностика (сервер)
 
 ```bash
 sudo ./scripts/diagnose.sh
 ```
 
-Этот скрипт проверит:
-- ✅ Конфигурацию server.toml (external_interface, enable_nat)
-- ✅ Сетевые интерфейсы
-- ✅ IP forwarding
-- ✅ NAT/iptables правила
-- ✅ Статус systemd сервиса
-- ✅ Подключение к интернету
+Проверяет: конфигурацию, сетевые интерфейсы, IP forwarding, NAT/iptables, systemd-сервис, подключение к интернету.
 
-**Типичная проблема:** `external_interface = "tun0"` в конфигурации
+### Типичные проблемы
 
-❌ **Неправильно:**
+**1. `external_interface = "tun0"` в server.toml**
+
 ```toml
-external_interface = "tun0"  # tun0 - это сам VPN интерфейс!
-```
+# НЕПРАВИЛЬНО — tun0 это сам VPN интерфейс!
+external_interface = "tun0"
 
-✅ **Правильно:**
-```toml
-external_interface = "ens3"  # или eth0, ens5 - ваш внешний интерфейс
+# ПРАВИЛЬНО — ваш внешний интерфейс
+external_interface = "ens3"   # или eth0, ens5 (Linux), en0 (macOS)
 ```
-
-Узнать правильный интерфейс:
-```bash
-ip route show default  # покажет основной интерфейс
-```
-
-#### Ручная проверка на сервере
 
 ```bash
-# IP forwarding включен?
-sudo sysctl net.ipv4.ip_forward  # должно быть = 1
-
-# NAT правила настроены?
-sudo iptables -t nat -L -n -v | grep MASQUERADE  # Linux
-sudo pfctl -s nat                                # macOS
-
-# Статус сервера
-sudo systemctl status gatekeeper
-sudo journalctl -u gatekeeper -f
+ip route show default  # покажет правильный интерфейс
 ```
 
-#### Проверка на клиенте
+**2. Ping к VPN gateway не работает на macOS**
 
-```bash
-# TUN интерфейс создан?
-ifconfig | grep utun  # macOS
-ip addr | grep tun    # Linux
-
-# Маршруты настроены?
-netstat -rn | grep "0.0.0.0"
-```
-
-#### Специфичные проблемы macOS
-
-**Проблема:** Ping к VPN gateway (10.10.10.1) не работает, хотя handshake успешен.
-
-**Причина:** Библиотека `tun` на macOS добавляет неправильный автоматический маршрут с несуществующим gateway (10.0.0.255).
-
-**Решение:** Клиент автоматически исправляет маршруты при подключении (начиная с версии после 2026-01-19). В логах должны быть:
-
+Клиент автоматически исправляет маршруты. В логах должно быть:
 ```
 [INFO] Removing incorrect VPN subnet route for 10.10.10/24
 [INFO] Adding host route for VPN gateway 10.10.10.1 through utun8
 [INFO] Adding correct route for VPN subnet 10.10.10/24 through utun8
 ```
 
-Если проблемы остались, проверьте маршруты вручную:
+**3. Ручная проверка на сервере**
 
 ```bash
-# Во время работы VPN
-netstat -rn | grep 10.10.10
+# IP forwarding включен?
+sudo sysctl net.ipv4.ip_forward   # должно быть = 1
 
-# Должны видеть:
-# 10.10.10.1         utun8              UH      utun8     ← host route для gateway
-# 10.10.10/24        utun8              USc     utun8     ← subnet route
+# NAT правила настроены?
+sudo iptables -t nat -L -n -v | grep MASQUERADE   # Linux
+sudo pfctl -s nat                                   # macOS
+
+# Логи сервера
+sudo journalctl -u gatekeeper -f
 ```
 
-**Отладка с tcpdump:**
+**4. Ручная проверка на клиенте**
 
 ```bash
-# В одном терминале - запустить VPN клиента
-sudo ./target/release/gatekeeper-client -c client.conf
+# TUN интерфейс создан?
+ifconfig | grep utun   # macOS
+ip addr | grep tun     # Linux
 
-# В другом терминале - смотреть трафик на TUN
-sudo tcpdump -i utun8 -n icmp
-
-# В третьем терминале - сделать ping
-ping -c 3 10.10.10.1
-
-# В tcpdump должны появиться ICMP пакеты!
+# Маршруты настроены?
+netstat -rn | grep "0.0.0.0"
 ```
+
+## Безопасность
+
+| Компонент | Реализация |
+|-----------|------------|
+| Handshake | Noise Protocol IK pattern |
+| Key Exchange | X25519 (Curve25519) |
+| Encryption | ChaCha20-Poly1305 (AEAD) |
+| Hash | BLAKE2s |
+| Replay Protection | SlidingWindow (2048-bit bitmap) |
+| Authorization | Per-client public key whitelist |
+| Nonce | 8-byte counter (little-endian) |
+
+Криптография реализована через библиотеку [snow](https://crates.io/crates/snow) — проверенную реализацию Noise Protocol Framework.
 
 ## Порты и протоколы
 
-- **UDP 51820** — основной порт VPN (можно изменить)
+- **UDP 51820** — основной порт VPN (можно изменить в `listen`)
 
 ## Требования
 
 - **ОС:** Linux (Ubuntu/Debian) или macOS
-  - ✅ Протестировано на Ubuntu 22.04+
-  - ✅ Протестировано на macOS (с автоматическим исправлением маршрутов)
-- **Права:** Root (для создания TUN интерфейса)
-- **Сборка:** Rust 1.75+ (для компиляции из исходников)
-
-## Безопасность
-
-- Noise Protocol IK pattern
-- X25519 для обмена ключами
-- ChaCha20-Poly1305 для шифрования
-- Защита от replay-атак (SlidingWindow)
-- Авторизация по публичному ключу
+- **Права:** Root (для создания TUN-интерфейса)
+- **Сборка:** Rust 1.75+
 
 ## Лицензия
 

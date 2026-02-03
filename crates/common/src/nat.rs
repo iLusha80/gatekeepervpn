@@ -163,6 +163,78 @@ pass out on {} all
     Ok(())
 }
 
+/// Cleanup NAT rules when VPN server stops
+#[cfg(target_os = "linux")]
+pub fn cleanup_nat(config: &NatConfig) -> Result<(), Error> {
+    log::info!("Cleaning up NAT rules...");
+
+    // Remove MASQUERADE rule
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            &config.vpn_subnet,
+            "-o",
+            &config.external_interface,
+            "-j",
+            "MASQUERADE",
+        ])
+        .status();
+
+    // Remove FORWARD rules
+    let _ = Command::new("iptables")
+        .args([
+            "-D",
+            "FORWARD",
+            "-i",
+            &config.tun_interface,
+            "-o",
+            &config.external_interface,
+            "-j",
+            "ACCEPT",
+        ])
+        .status();
+
+    let _ = Command::new("iptables")
+        .args([
+            "-D",
+            "FORWARD",
+            "-i",
+            &config.external_interface,
+            "-o",
+            &config.tun_interface,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ])
+        .status();
+
+    log::info!("NAT rules cleaned up");
+    Ok(())
+}
+
+/// Cleanup NAT rules when VPN server stops
+#[cfg(target_os = "macos")]
+pub fn cleanup_nat(config: &NatConfig) -> Result<(), Error> {
+    log::info!("Cleaning up NAT rules...");
+
+    // Disable pf
+    let _ = Command::new("pfctl").args(["-d"]).status();
+
+    // Remove rules file
+    let _ = std::fs::remove_file("/tmp/gatekeeper_pf.conf");
+
+    let _ = config; // suppress unused warning
+    log::info!("NAT rules cleaned up");
+    Ok(())
+}
+
 /// Generate setup script for manual execution
 pub fn generate_setup_script(config: &NatConfig) -> String {
     #[cfg(target_os = "linux")]
