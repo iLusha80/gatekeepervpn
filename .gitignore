@@ -4,5 +4,8 @@
 *.md
 !README.md
 
+# Deploy config (contains server SSH address)
+.deploy.conf
+
 # Other generated files
 x.txt

@@ -388,27 +388,122 @@ pub fn print_nat_instructions(tun_name: &str, vpn_subnet: &str) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_nat_config() {
-        let config = NatConfig {
+    fn test_config() -> NatConfig {
+        NatConfig {
             tun_interface: "utun5".to_string(),
             external_interface: "en0".to_string(),
             vpn_subnet: "10.0.0.0/24".to_string(),
-        };
+        }
+    }
 
+    #[test]
+    fn test_nat_config() {
+        let config = test_config();
         assert_eq!(config.tun_interface, "utun5");
+        assert_eq!(config.external_interface, "en0");
         assert_eq!(config.vpn_subnet, "10.0.0.0/24");
     }
 
     #[test]
-    fn test_generate_setup_script() {
-        let config = NatConfig {
-            tun_interface: "utun5".to_string(),
-            external_interface: "en0".to_string(),
-            vpn_subnet: "10.0.0.0/24".to_string(),
-        };
+    fn test_nat_config_clone() {
+        let config = test_config();
+        let cloned = config.clone();
+        assert_eq!(config.tun_interface, cloned.tun_interface);
+        assert_eq!(config.external_interface, cloned.external_interface);
+        assert_eq!(config.vpn_subnet, cloned.vpn_subnet);
+    }
 
+    #[test]
+    fn test_generate_setup_script() {
+        let config = test_config();
         let script = generate_setup_script(&config);
         assert!(script.contains("10.0.0.0/24"));
+        assert!(script.contains("en0"));
+        assert!(script.contains("utun5"));
+        assert!(script.contains("NAT"));
+    }
+
+    #[test]
+    fn test_generate_cleanup_script() {
+        let config = test_config();
+        let script = generate_cleanup_script(&config);
+        // Cleanup script должен содержать команды удаления
+        assert!(script.contains("Cleanup"));
+
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: iptables -D (delete) вместо -A (add)
+            assert!(script.contains("iptables"));
+            assert!(script.contains("-D"));
+            assert!(script.contains("10.0.0.0/24"));
+            assert!(script.contains("en0"));
+            assert!(script.contains("utun5"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(script.contains("pfctl -d"));
+        }
+    }
+
+    #[test]
+    fn test_setup_cleanup_script_symmetry() {
+        let config = test_config();
+        let setup = generate_setup_script(&config);
+        let cleanup = generate_cleanup_script(&config);
+
+        // Setup и cleanup должны быть разными скриптами
+        assert_ne!(setup, cleanup);
+
+        // Оба должны быть bash-скриптами
+        assert!(setup.contains("#!/bin/bash"));
+        assert!(cleanup.contains("#!/bin/bash"));
+
+        #[cfg(target_os = "linux")]
+        {
+            // Setup добавляет правила (-A), cleanup удаляет (-D)
+            assert!(setup.contains("-A POSTROUTING"));
+            assert!(cleanup.contains("-D POSTROUTING"));
+            assert!(setup.contains("-A FORWARD"));
+            assert!(cleanup.contains("-D FORWARD"));
+
+            // Оба должны содержать одинаковый subnet и интерфейсы
+            assert!(setup.contains(&config.vpn_subnet));
+            assert!(cleanup.contains(&config.vpn_subnet));
+            assert!(setup.contains(&config.external_interface));
+            assert!(cleanup.contains(&config.external_interface));
+        }
+    }
+
+    #[test]
+    fn test_generate_scripts_with_different_configs() {
+        let config1 = NatConfig {
+            tun_interface: "tun0".to_string(),
+            external_interface: "eth0".to_string(),
+            vpn_subnet: "10.10.10.0/24".to_string(),
+        };
+        let config2 = NatConfig {
+            tun_interface: "tun1".to_string(),
+            external_interface: "ens3".to_string(),
+            vpn_subnet: "192.168.100.0/24".to_string(),
+        };
+
+        let script1 = generate_setup_script(&config1);
+        let script2 = generate_setup_script(&config2);
+
+        // Разные конфиги порождают разные скрипты
+        assert_ne!(script1, script2);
+
+        assert!(script1.contains("eth0"));
+        assert!(script2.contains("ens3"));
+
+        assert!(script1.contains("10.10.10.0/24"));
+        assert!(script2.contains("192.168.100.0/24"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(script1.contains("tun0"));
+            assert!(script2.contains("tun1"));
+        }
     }
 }

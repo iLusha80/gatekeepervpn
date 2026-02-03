@@ -144,4 +144,48 @@ mod tests {
         let result = Packet::decode(data);
         assert!(matches!(result, Err(Error::InvalidPacket)));
     }
+
+    #[test]
+    fn test_keepalive_packets() {
+        let ka = Packet::keep_alive();
+        assert_eq!(ka.packet_type, PacketType::KeepAlive);
+        assert!(ka.payload.is_empty());
+
+        // Encode -> decode roundtrip
+        let encoded = ka.encode();
+        let decoded = Packet::decode(encoded).unwrap();
+        assert_eq!(decoded.packet_type, PacketType::KeepAlive);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_keepalive_ack_packets() {
+        let ka_ack = Packet::keep_alive_ack();
+        assert_eq!(ka_ack.packet_type, PacketType::KeepAliveAck);
+        assert!(ka_ack.payload.is_empty());
+
+        // Encode -> decode roundtrip
+        let encoded = ka_ack.encode();
+        let decoded = Packet::decode(encoded).unwrap();
+        assert_eq!(decoded.packet_type, PacketType::KeepAliveAck);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_all_packet_types_roundtrip() {
+        let packets = vec![
+            Packet::handshake_init(vec![1, 2, 3]),
+            Packet::handshake_response(vec![4, 5, 6]),
+            Packet::data(vec![7, 8, 9]),
+            Packet::keep_alive(),
+            Packet::keep_alive_ack(),
+        ];
+
+        for original in packets {
+            let ptype = original.packet_type;
+            let encoded = original.encode();
+            let decoded = Packet::decode(encoded).unwrap();
+            assert_eq!(decoded.packet_type, ptype, "Roundtrip failed for {:?}", ptype);
+        }
+    }
 }
