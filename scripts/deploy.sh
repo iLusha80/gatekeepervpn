@@ -122,6 +122,14 @@ validate_server() {
 
 check_ssh() {
     info "Проверяю SSH-подключение к $SERVER..."
+
+    # Подсказка про пароль
+    if ! ssh-add -l &>/dev/null; then
+        warn "SSH-агент не содержит ключей. Если будет запрашиваться пароль несколько раз:"
+        warn "  ssh-add ~/.ssh/id_rsa   # или ваш ключ"
+        echo ""
+    fi
+
     if ! ssh $SSH_OPTS "$SERVER" "echo ok" &>/dev/null; then
         err "Не удалось подключиться к $SERVER"
     fi
@@ -171,10 +179,14 @@ deploy_build() {
         source "\$HOME/.cargo/env" 2>/dev/null || true
         cargo build --release 2>&1 | tail -5
 
+        echo "[INFO] Остановка сервиса перед заменой бинарников..."
+        sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        sleep 1
+
         echo "[INFO] Установка бинарников..."
-        cp target/release/gatekeeper-server "$REMOTE_BIN_DIR/" 2>/dev/null || sudo cp target/release/gatekeeper-server "$REMOTE_BIN_DIR/"
-        cp target/release/gatekeeper-client "$REMOTE_BIN_DIR/" 2>/dev/null || sudo cp target/release/gatekeeper-client "$REMOTE_BIN_DIR/"
-        cp target/release/gkvpn "$REMOTE_BIN_DIR/" 2>/dev/null || sudo cp target/release/gkvpn "$REMOTE_BIN_DIR/"
+        sudo cp target/release/gatekeeper-server "$REMOTE_BIN_DIR/"
+        sudo cp target/release/gatekeeper-client "$REMOTE_BIN_DIR/"
+        sudo cp target/release/gkvpn "$REMOTE_BIN_DIR/"
 
         echo "[OK] Бинарники установлены"
 
@@ -184,11 +196,11 @@ REMOTE_SCRIPT
 
     ok "Сборка на сервере завершена"
 
-    # 4. Рестарт
+    # 4. Рестарт (сервис уже остановлен, всегда запускаем обратно)
     if [ "$NO_RESTART" = false ]; then
         restart_service
     else
-        warn "Рестарт пропущен (--no-restart)"
+        warn "Сервис остановлен и НЕ перезапущен (--no-restart). Запустите вручную: sudo systemctl start $SERVICE_NAME"
     fi
 
     echo ""
@@ -235,8 +247,11 @@ deploy_binary() {
 
     ok "Компиляция завершена"
 
-    # 3. Отправляем бинарники
+    # 3. Останавливаем сервис и отправляем бинарники
     local build_dir="$PROJECT_DIR/target/$target/release"
+    info "Останавливаю сервис перед заменой бинарников..."
+    ssh $SSH_OPTS "$SERVER" "sudo systemctl stop $SERVICE_NAME 2>/dev/null || true; sleep 1"
+
     info "Отправляю бинарники на $SERVER..."
 
     for bin in "${BINARIES[@]}"; do
@@ -256,11 +271,11 @@ deploy_binary() {
 
     ok "Бинарники отправлены"
 
-    # 4. Рестарт
+    # 4. Рестарт (сервис уже остановлен)
     if [ "$NO_RESTART" = false ]; then
         restart_service
     else
-        warn "Рестарт пропущен (--no-restart)"
+        warn "Сервис остановлен и НЕ перезапущен (--no-restart). Запустите вручную: sudo systemctl start $SERVICE_NAME"
     fi
 
     echo ""
