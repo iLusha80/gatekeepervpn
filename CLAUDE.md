@@ -38,15 +38,22 @@ cargo run --bin keygen -- show-public -k keys/private.key
 
 | Модуль | Назначение |
 |--------|------------|
-| `handshake` | Noise IK protocol: `Initiator`, `Responder`, `Transport` |
+| `handshake` | Noise IK protocol: `Initiator`, `Responder`, `Transport`, `can_decrypt()` |
 | `protocol` | Бинарный протокол: `Packet`, `PacketType` |
 | `crypto` | Генерация ключей X25519 |
 | `transport` | `StatelessTransportState` + replay protection (SlidingWindow) |
-| `tun_device` | Async TUN интерфейс |
+| `tun_device` | Async TUN интерфейс (`TunDevice`, `TunReader`, `TunWriter`) |
 | `routing` | Настройка системных маршрутов |
 | `socket` | Настройка UDP буферов |
 | `logging` | Rate-limited логирование |
 | `config` | `ClientConfig`, `ServerConfig` (TOML) |
+| `metrics` | `VpnMetrics` — атомарные счётчики (packets, bytes, handshakes, replay, roaming) |
+| `obfuscation` | `PacketObfuscator` — anti-DPI: XOR header, random padding, junk packets |
+| `cookie` | `CookieState`, `HandshakeRateLimiter` — DoS protection |
+| `nat` | Настройка NAT (iptables/pf) |
+| `dns` | Настройка DNS при подключении клиента |
+| `ip_pool` | Пул VPN IP-адресов |
+| `ip_parser` | Парсинг IP-заголовков для unicast routing |
 
 ### Поток данных
 
@@ -60,6 +67,39 @@ Server:  UDP recv → decrypt → TUN write → kernel routing → response
 1. Client → Server: `HandshakeInit` (e, es, s, ss)
 2. Server → Client: `HandshakeResponse` (e, ee, se)
 3. Обе стороны переходят в `Transport` mode с session keys
+
+### Roaming (переключение сети без разрыва)
+
+Подход WireGuard: успешная расшифровка AEAD = аутентификация отправителя.
+
+**Сервер:**
+- Primary key клиентов = VPN IP (`clients: HashMap<Ipv4Addr, ConnectedClient>`)
+- Обратный индекс `endpoint_to_ip: HashMap<SocketAddr, Ipv4Addr>`
+- Data от неизвестного addr → brute-force `can_decrypt()` по всем клиентам → обновление endpoint
+- KeepAlive от неизвестного addr → игнорируется (roaming сработает по Data)
+
+**Клиент:**
+- `run_vpn_loop` возвращает `VpnExitReason` (Shutdown / ConnectionTimeout)
+- При timeout → новый UDP socket → roam ping (encrypted empty Data) → retry
+- Если soft roam не удался → fallback на полный re-handshake
+
+### Серверная архитектура (известное ограничение)
+
+**`Arc<Mutex<Server>>`** — глобальный мьютекс на всё серверное состояние. Все операции
+(UDP→TUN, TUN→UDP, handshake, cleanup) сериализуются через этот лок. Это основное
+узкое горло при масштабировании:
+
+- Каждый входящий/исходящий пакет блокирует мьютекс
+- Шифрование/расшифровка пакетов происходит внутри лока
+- При N клиентах с высоким трафиком — contention растёт линейно
+- Brute-force roaming detection (O(n) `can_decrypt` вызовов) тоже под мьютексом
+
+**Решение (будущее):** заменить на per-client locks или lock-free структуру:
+```
+HashMap<Ipv4Addr, Arc<RwLock<ConnectedClient>>>   # per-client lock
+DashMap<Ipv4Addr, ConnectedClient>                 # lock-free concurrent map
+```
+Шифрование/расшифровку вынести за пределы лока (Transport уже thread-safe).
 
 ---
 
@@ -98,6 +138,7 @@ pub enum Error {
 * `unsafe` запрещён без крайней необходимости
 * Криптографические тесты не должны зависеть от сети
 * Rate-limited логирование для частых ошибок (UDP buffer overflow, replay packets)
+* `Transport` — thread-safe без внешнего Mutex (`AtomicU64` counter + `Mutex` внутри SlidingWindow)
 
 ---
 

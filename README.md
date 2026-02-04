@@ -8,9 +8,11 @@
 - **ChaCha20-Poly1305** — быстрое AEAD-шифрование
 - **X25519** — эллиптический обмен ключами (128-bit equivalent security)
 - **Replay protection** — защита от повторных пакетов (SlidingWindow 2048 бит)
+- **Roaming** — переключение сети (WiFi→LTE, смена NAT) без разрыва VPN-сессии
 - **Per-client IP** — каждый клиент получает уникальный IP из пула
 - **Авторизация** — только клиенты из белого списка (peers.toml)
 - **Unicast роутинг** — трафик идёт только нужному клиенту
+- **Traffic Obfuscation** — anti-DPI: XOR header, random padding, junk packets
 - **Автоматическая настройка NAT** — сервер автоматически включает IP forwarding и настраивает NAT
 - **Hot-reload** — изменения peers.toml применяются без перезапуска сервера
 - **Keep-alive + автопереподключение** — клиент восстанавливает соединение при обрыве
@@ -225,6 +227,22 @@ sudo systemctl stop gatekeeper
 sudo kill $(pgrep gatekeeper-server)
 ```
 
+## Roaming (переключение сети)
+
+VPN-сессия сохраняется при смене IP клиента (WiFi→LTE, смена NAT, перезагрузка роутера).
+Не требует повторного handshake — используется подход WireGuard.
+
+**Как работает:**
+1. Клиент обнаруживает потерю связи (KeepAlive timeout)
+2. Создаёт новый UDP socket и отправляет зашифрованный "roam ping"
+3. Сервер пытается расшифровать пакет ключами каждого клиента (`can_decrypt`)
+4. При успехе — обновляет endpoint клиента, трафик продолжается
+5. Если soft roam не удался — клиент делает полный re-handshake
+
+**Ограничения:**
+- Brute-force поиск клиента при roaming — O(n), приемлемо при n < 100
+- KeepAlive от неизвестного адреса игнорируется (roaming срабатывает по Data-пакету)
+
 ## Конфигурация
 
 ### server.toml
@@ -407,8 +425,27 @@ netstat -rn | grep "0.0.0.0"
 | Replay Protection | SlidingWindow (2048-bit bitmap) |
 | Authorization | Per-client public key whitelist |
 | Nonce | 8-byte counter (little-endian) |
+| DoS Protection | Cookie challenge + per-IP rate limiting |
+| Roaming Auth | AEAD decrypt = identity proof (no re-handshake) |
+| Obfuscation | Header XOR (BLAKE2s-derived), random padding, junk packets |
 
 Криптография реализована через библиотеку [snow](https://crates.io/crates/snow) — проверенную реализацию Noise Protocol Framework.
+
+## Известные ограничения
+
+### Глобальный Mutex на сервере
+
+Серверное состояние защищено `Arc<Mutex<Server>>`. Каждый пакет (входящий и исходящий)
+проходит через этот единственный лок:
+
+- Шифрование/расшифровка выполняется внутри мьютекса
+- При roaming — brute-force `can_decrypt()` по всем клиентам тоже под локом
+- Contention растёт линейно с числом клиентов и объёмом трафика
+
+**На практике:** достаточно для десятков клиентов. При сотнях клиентов с высоким
+трафиком мьютекс станет узким горлом и потребуется рефакторинг на per-client locks
+или lock-free структуры (`DashMap`). Transport уже thread-safe — криптографию
+можно вынести за пределы лока.
 
 ## Порты и протоколы
 

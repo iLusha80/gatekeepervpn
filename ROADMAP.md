@@ -26,6 +26,7 @@
 | DNS через VPN | Автонастройка DNS при подключении (macOS/Linux) |
 | Метрики | AtomicU64 счётчики, JSON stats, `gkvpn status` |
 | Traffic Obfuscation | Anti-DPI: header XOR, random padding/header, junk packets (PSK-based) |
+| Roaming | Переключение сети (WiFi→LTE) без re-handshake, soft roam на клиенте |
 
 ---
 
@@ -75,8 +76,9 @@ Multi-stage build, Alpine base, volume для конфигов, health check.
 |----------|-----------|
 | 3 | 3 |
 
-### Roaming
-Обновление client endpoint при валидном пакете с нового адреса. Переключение WiFi/LTE без разрыва.
+### ~~Roaming~~ ✅
+~~Обновление client endpoint при валидном пакете с нового адреса. Переключение WiFi/LTE без разрыва.~~
+Реализовано: brute-force `can_decrypt()` на сервере, soft roam loop на клиенте (новый socket + roam ping), fallback на re-handshake.
 
 | Важность | Сложность |
 |----------|-----------|
@@ -157,11 +159,32 @@ REST API + фронтенд: подключённые клиенты, метри
 
 ---
 
-## Phase 6: Производительность (low priority)
+## Phase 6: Производительность
+
+### Устранение глобального Mutex на сервере (приоритет!)
+
+Сейчас `Arc<Mutex<Server>>` сериализует всю обработку пакетов. Это главное узкое горло:
+
+- Каждый входящий/исходящий пакет блокирует мьютекс
+- Шифрование/расшифровка (CPU-intensive) происходит внутри лока
+- Roaming detection (brute-force `can_decrypt` по всем клиентам) тоже под локом
+- Contention растёт линейно с числом клиентов
+
+**План решения:**
+1. Заменить `HashMap<Ipv4Addr, ConnectedClient>` на `DashMap` или `HashMap<Ipv4Addr, Arc<RwLock<ConnectedClient>>>`
+2. Вынести encrypt/decrypt за пределы лока (Transport уже thread-safe: `AtomicU64` + внутренний `Mutex` в SlidingWindow)
+3. Разделить мьютекс: отдельный лок для handshake/register, отдельный — для endpoint_to_ip
+4. Roaming detection вынести в отдельную фазу: сначала `can_decrypt` (read-only, без лока), потом обновление endpoint (write, короткий лок)
+
+| Важность | Сложность |
+|----------|-----------|
+| 5 | 3 |
+
+### Прочее
 
 - **MTU Discovery** — автоподбор оптимального MTU (PMTUD)
 - **Zero-Copy I/O** — io_uring, splice, buffer pooling
-- **Multi-threading** — per-client crypto offload, lock-free structures
+- **Multi-threading** — per-client crypto offload
 - **Hardware Acceleration** — AES-NI, AVX2/AVX512 для ChaCha20
 
 ---
@@ -180,7 +203,7 @@ REST API + фронтенд: подключённые клиенты, метри
 | Hot-reload | no | yes |
 | Metrics/stats | no | yes |
 | IPv6 | yes | -- |
-| Roaming | yes | -- |
+| Roaming | yes | yes |
 | AllowedIPs | yes | -- |
 | Key rotation | yes | -- |
 | Kernel mode | yes | -- |
