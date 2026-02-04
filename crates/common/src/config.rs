@@ -128,8 +128,8 @@ impl Default for PeersConfig {
 /// Configuration for UDP packet obfuscation (anti-DPI)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObfuscationConfig {
-    /// Enable obfuscation
-    #[serde(default)]
+    /// Enable obfuscation (default: true)
+    #[serde(default = "default_obfuscation_enabled")]
     pub enabled: bool,
     /// Pre-shared key for header encryption (base64, 32 bytes)
     #[serde(default)]
@@ -151,6 +151,10 @@ pub struct ObfuscationConfig {
     pub junk_max: u8,
 }
 
+fn default_obfuscation_enabled() -> bool {
+    true
+}
+
 fn default_max_padding() -> usize {
     32
 }
@@ -162,12 +166,12 @@ fn default_junk_max() -> u8 {
 impl Default for ObfuscationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             psk: String::new(),
-            header_size: 0,
-            min_padding: 0,
+            header_size: 4,
+            min_padding: 16,
             max_padding: default_max_padding(),
-            junk_min: 0,
+            junk_min: 1,
             junk_max: default_junk_max(),
         }
     }
@@ -466,12 +470,12 @@ mod tests {
     #[test]
     fn test_obfuscation_config_default() {
         let config = ObfuscationConfig::default();
-        assert!(!config.enabled);
-        assert!(config.psk.is_empty());
-        assert_eq!(config.header_size, 0);
-        assert_eq!(config.min_padding, 0);
+        assert!(config.enabled);
+        assert!(config.psk.is_empty()); // auto-generated at runtime
+        assert_eq!(config.header_size, 4);
+        assert_eq!(config.min_padding, 16);
         assert_eq!(config.max_padding, 32);
-        assert_eq!(config.junk_min, 0);
+        assert_eq!(config.junk_min, 1);
         assert_eq!(config.junk_max, 3);
     }
 
@@ -513,10 +517,25 @@ mod tests {
     }
 
     #[test]
-    fn test_server_config_without_obfuscation() {
+    fn test_server_config_without_obfuscation_section() {
         let toml_str = r#"
             listen = "0.0.0.0:51820"
             private_key = "test"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        // Obfuscation enabled by default (PSK auto-generated at runtime)
+        assert!(config.obfuscation.enabled);
+        assert_eq!(config.obfuscation.header_size, 4);
+    }
+
+    #[test]
+    fn test_server_config_obfuscation_disabled_explicit() {
+        let toml_str = r#"
+            listen = "0.0.0.0:51820"
+            private_key = "test"
+
+            [obfuscation]
+            enabled = false
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.obfuscation.enabled);

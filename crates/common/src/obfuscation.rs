@@ -21,10 +21,14 @@ pub struct PacketObfuscator {
     max_padding: usize,
     junk_min: u8,
     junk_max: u8,
+    /// Auto-generated PSK (Some if was generated, None if provided or disabled)
+    generated_psk: Option<String>,
 }
 
 impl PacketObfuscator {
-    /// Create a new obfuscator from config
+    /// Create a new obfuscator from config.
+    /// If enabled and PSK is empty, generates a random PSK automatically.
+    /// Use `generated_psk()` to retrieve it for sharing with the other side.
     pub fn new(config: &ObfuscationConfig) -> Result<Self, Error> {
         if !config.enabled {
             return Ok(Self {
@@ -35,24 +39,28 @@ impl PacketObfuscator {
                 max_padding: 0,
                 junk_min: 0,
                 junk_max: 0,
+                generated_psk: None,
             });
         }
 
-        if config.psk.is_empty() {
-            return Err(Error::Obfuscation(
-                "PSK is required when obfuscation is enabled".to_string(),
-            ));
-        }
-
-        let psk_bytes = crate::config::keys::decode(&config.psk)
-            .map_err(|_| Error::Obfuscation("invalid PSK: base64 decode failed".to_string()))?;
-
-        if psk_bytes.len() != 32 {
-            return Err(Error::Obfuscation(format!(
-                "PSK must be 32 bytes, got {}",
-                psk_bytes.len()
-            )));
-        }
+        let (psk_bytes, generated_psk) = if config.psk.is_empty() {
+            // Auto-generate PSK
+            use rand::RngCore;
+            let mut psk = [0u8; 32];
+            rand::rng().fill_bytes(&mut psk);
+            let encoded = crate::config::keys::encode(&psk);
+            (psk.to_vec(), Some(encoded))
+        } else {
+            let bytes = crate::config::keys::decode(&config.psk)
+                .map_err(|_| Error::Obfuscation("invalid PSK: base64 decode failed".to_string()))?;
+            if bytes.len() != 32 {
+                return Err(Error::Obfuscation(format!(
+                    "PSK must be 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            (bytes, None)
+        };
 
         // Derive header key from PSK using BLAKE2s
         let header_key = derive_header_key(&psk_bytes);
@@ -77,7 +85,14 @@ impl PacketObfuscator {
             max_padding: config.max_padding,
             junk_min: config.junk_min,
             junk_max: config.junk_max,
+            generated_psk,
         })
+    }
+
+    /// Returns the auto-generated PSK if one was created (PSK was empty in config).
+    /// Returns None if PSK was provided in config or obfuscation is disabled.
+    pub fn generated_psk(&self) -> Option<&str> {
+        self.generated_psk.as_deref()
     }
 
     /// Returns whether obfuscation is enabled
@@ -331,7 +346,10 @@ mod tests {
 
     #[test]
     fn test_disabled_mode_passthrough() {
-        let config = ObfuscationConfig::default(); // enabled = false
+        let config = ObfuscationConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let obf = PacketObfuscator::new(&config).unwrap();
         let packet = Packet::data(b"hello".to_vec());
 
@@ -379,20 +397,37 @@ mod tests {
 
     #[test]
     fn test_junk_count_disabled() {
-        let config = ObfuscationConfig::default();
+        let config = ObfuscationConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let obf = PacketObfuscator::new(&config).unwrap();
         assert_eq!(obf.junk_count(), 0);
     }
 
     #[test]
-    fn test_psk_required_when_enabled() {
+    fn test_auto_generate_psk_when_empty() {
         let config = ObfuscationConfig {
             enabled: true,
             psk: String::new(),
             ..Default::default()
         };
-        let result = PacketObfuscator::new(&config);
-        assert!(result.is_err());
+        let obf = PacketObfuscator::new(&config).unwrap();
+        assert!(obf.is_enabled());
+        assert!(obf.generated_psk().is_some());
+
+        // Roundtrip should work with auto-generated PSK
+        let packet = Packet::data(b"test".to_vec());
+        let obfuscated = obf.obfuscate(&packet);
+        let restored = obf.deobfuscate(obfuscated).unwrap();
+        assert_eq!(restored.packet_type, PacketType::Data);
+        assert_eq!(&restored.payload[..], b"test");
+    }
+
+    #[test]
+    fn test_explicit_psk_no_generated() {
+        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        assert!(obf.generated_psk().is_none());
     }
 
     #[test]

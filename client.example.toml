@@ -14,13 +14,14 @@ server_public_key = ""
 # DNS servers to use when VPN is connected (empty = don't change DNS)
 # dns_servers = ["1.1.1.1", "8.8.8.8"]
 
-# Obfuscation (anti-DPI). Must match on server and client.
+# Obfuscation (anti-DPI). Enabled by default.
+# PSK auto-generated if not set, but must match on server and client.
 # Generate PSK: gkvpn generate-psk
 # [obfuscation]
-# enabled = true
-# psk = "base64-encoded-32-byte-key"
-# header_size = 4
-# min_padding = 16
-# max_padding = 64
-# junk_min = 1
-# junk_max = 3
+# enabled = true           # default: true
+# psk = "base64-encoded-32-byte-key"  # auto-generated if empty
+# header_size = 4          # default: 4
+# min_padding = 16         # default: 16
+# max_padding = 64         # default: 32
+# junk_min = 1             # default: 1
+# junk_max = 3             # default: 3

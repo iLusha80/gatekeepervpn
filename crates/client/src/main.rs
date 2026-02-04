@@ -583,10 +583,15 @@ async fn main() -> Result<()> {
         keys::decode(&config.server_public_key).context("Invalid server public key format")?;
 
     // Create obfuscator
-    let obfuscator = Arc::new(
-        PacketObfuscator::new(&config.obfuscation).context("Failed to create packet obfuscator")?,
-    );
+    let obfuscator =
+        PacketObfuscator::new(&config.obfuscation).context("Failed to create packet obfuscator")?;
     if config.obfuscation.enabled {
+        if let Some(psk) = obfuscator.generated_psk() {
+            log::warn!("Obfuscation PSK auto-generated (not in config)");
+            log::info!("Generated PSK: {}", psk);
+            log::info!("Add to [obfuscation] section in both server and client configs:");
+            log::info!("  psk = \"{}\"", psk);
+        }
         log::info!(
             "Packet obfuscation enabled (header_size={}, padding={}-{}, junk={}-{})",
             config.obfuscation.header_size,
@@ -596,6 +601,7 @@ async fn main() -> Result<()> {
             config.obfuscation.junk_max
         );
     }
+    let obfuscator = Arc::new(obfuscator);
 
     if args.test {
         // Test mode - single connection, no reconnect

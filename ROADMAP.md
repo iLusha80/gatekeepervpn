@@ -25,6 +25,7 @@
 | Cleanup неактивных | Автоотключение idle-клиентов (client_timeout) |
 | DNS через VPN | Автонастройка DNS при подключении (macOS/Linux) |
 | Метрики | AtomicU64 счётчики, JSON stats, `gkvpn status` |
+| Traffic Obfuscation | Anti-DPI: header XOR, random padding/header, junk packets (PSK-based) |
 
 ---
 
@@ -99,8 +100,10 @@ Multi-stage build, Alpine base, volume для конфигов, health check.
 
 ## Phase 4: Безопасность и обфускация
 
-### Traffic Obfuscation
-Маскировка VPN трафика под HTTPS. TLS wrapper (rustls), pluggable transports, padding.
+### ~~Traffic Obfuscation~~ ✅ (базовый уровень)
+~~Маскировка VPN трафика под HTTPS.~~ Реализовано: header XOR (BLAKE2s), random padding, random header, junk packets. Включено по умолчанию.
+
+**Следующий уровень:** TLS wrapper (rustls) — маскировка под HTTPS, pluggable transports.
 
 | Важность | Сложность |
 |----------|-----------|
@@ -182,4 +185,4 @@ REST API + фронтенд: подключённые клиенты, метри
 | Key rotation | yes | -- |
 | Kernel mode | yes | -- |
 | GUI | wg-quick | -- |
-| Traffic obfuscation | no | -- |
+| Traffic obfuscation | no | yes (anti-DPI) |
