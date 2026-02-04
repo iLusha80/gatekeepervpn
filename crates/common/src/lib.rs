@@ -29,4 +29,4 @@ pub use obfuscation::PacketObfuscator;
 pub use protocol::{Packet, PacketType};
 pub use routing::{RouteConfig, cleanup_routes, setup_routes};
 pub use socket::{DEFAULT_BUFFER_SIZE, configure_socket, configure_socket_buffers};
-pub use tun_device::{TunConfig, TunDevice};
+pub use tun_device::{TunConfig, TunDevice, TunReader, TunWriter};

@@ -257,6 +257,20 @@ impl Transport {
         Ok(buf)
     }
 
+    /// Проверяет, может ли этот transport расшифровать пакет.
+    /// Не обновляет replay window — используется для roaming detection.
+    pub fn can_decrypt(&self, data: &[u8]) -> bool {
+        if data.len() < COUNTER_SIZE + TRANSPORT_OVERHEAD {
+            return false;
+        }
+        let counter = u64::from_le_bytes(data[..COUNTER_SIZE].try_into().unwrap());
+        let ciphertext = &data[COUNTER_SIZE..];
+        let mut buf = vec![0u8; ciphertext.len()];
+        self.state
+            .read_message(counter, ciphertext, &mut buf)
+            .is_ok()
+    }
+
     /// Decrypt a message with explicit counter
     ///
     /// Input: [8-byte counter][encrypted ciphertext]
@@ -353,6 +367,106 @@ mod tests {
         let ciphertext2 = server_transport.encrypt(plaintext2).unwrap();
         let decrypted2 = client_transport.decrypt(&ciphertext2).unwrap();
         assert_eq!(&decrypted2, plaintext2);
+    }
+
+    #[test]
+    fn test_can_decrypt_valid_key() {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_transport = initiator.into_transport().unwrap();
+        let server_transport = responder.into_transport().unwrap();
+
+        let ciphertext = client_transport.encrypt(b"test data").unwrap();
+        assert!(server_transport.can_decrypt(&ciphertext));
+    }
+
+    #[test]
+    fn test_can_decrypt_wrong_key() {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+        let other_server_keys = generate_keypair().unwrap();
+
+        // Session 1: client <-> server
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_transport = initiator.into_transport().unwrap();
+
+        // Session 2: different server (wrong key)
+        let other_client_keys = generate_keypair().unwrap();
+        let mut initiator2 =
+            Initiator::new(&other_client_keys.private, &other_server_keys.public).unwrap();
+        let mut responder2 = Responder::new(&other_server_keys.private).unwrap();
+
+        let msg1b = initiator2.write_message(&[]).unwrap();
+        responder2.read_message(&msg1b).unwrap();
+        let msg2b = responder2.write_message(&[]).unwrap();
+        initiator2.read_message(&msg2b).unwrap();
+
+        let other_transport = responder2.into_transport().unwrap();
+
+        let ciphertext = client_transport.encrypt(b"test data").unwrap();
+        assert!(!other_transport.can_decrypt(&ciphertext));
+    }
+
+    #[test]
+    fn test_can_decrypt_no_side_effects() {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_transport = initiator.into_transport().unwrap();
+        let server_transport = responder.into_transport().unwrap();
+
+        let ciphertext = client_transport.encrypt(b"test data").unwrap();
+
+        // can_decrypt should not affect replay window
+        assert!(server_transport.can_decrypt(&ciphertext));
+        assert!(server_transport.can_decrypt(&ciphertext));
+
+        // decrypt should still work after can_decrypt calls
+        let plaintext = server_transport.decrypt(&ciphertext).unwrap();
+        assert_eq!(&plaintext, b"test data");
+    }
+
+    #[test]
+    fn test_can_decrypt_short_data() {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let server_transport = responder.into_transport().unwrap();
+
+        assert!(!server_transport.can_decrypt(&[]));
+        assert!(!server_transport.can_decrypt(&[0; 10]));
     }
 
     #[test]

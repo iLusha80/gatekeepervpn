@@ -14,6 +14,7 @@ pub struct VpnMetrics {
     pub handshakes_completed: AtomicU64,
     pub handshakes_failed: AtomicU64,
     pub replay_packets_dropped: AtomicU64,
+    pub roaming_events: AtomicU64,
     pub active_clients: AtomicU64,
     pub start_time: Instant,
 }
@@ -28,6 +29,7 @@ impl Default for VpnMetrics {
             handshakes_completed: AtomicU64::new(0),
             handshakes_failed: AtomicU64::new(0),
             replay_packets_dropped: AtomicU64::new(0),
+            roaming_events: AtomicU64::new(0),
             active_clients: AtomicU64::new(0),
             start_time: Instant::now(),
         }
@@ -67,6 +69,11 @@ impl VpnMetrics {
         self.replay_packets_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a roaming event (client endpoint change)
+    pub fn record_roaming(&self) {
+        self.roaming_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Set the number of active clients
     pub fn set_active_clients(&self, n: u64) {
         self.active_clients.store(n, Ordering::Relaxed);
@@ -93,7 +100,8 @@ impl VpnMetrics {
              Packets sent: {}, received: {}\n\
              Bytes sent: {}, received: {}\n\
              Handshakes: {} ok, {} failed\n\
-             Replay packets dropped: {}",
+             Replay packets dropped: {}\n\
+             Roaming events: {}",
             hours,
             minutes,
             seconds,
@@ -105,6 +113,7 @@ impl VpnMetrics {
             self.handshakes_completed.load(Ordering::Relaxed),
             self.handshakes_failed.load(Ordering::Relaxed),
             self.replay_packets_dropped.load(Ordering::Relaxed),
+            self.roaming_events.load(Ordering::Relaxed),
         )
     }
 
@@ -120,7 +129,8 @@ impl VpnMetrics {
             \"bytes_received\":{},\
             \"handshakes_completed\":{},\
             \"handshakes_failed\":{},\
-            \"replay_packets_dropped\":{}\
+            \"replay_packets_dropped\":{},\
+            \"roaming_events\":{}\
             }}",
             self.uptime_secs(),
             self.active_clients.load(Ordering::Relaxed),
@@ -131,6 +141,7 @@ impl VpnMetrics {
             self.handshakes_completed.load(Ordering::Relaxed),
             self.handshakes_failed.load(Ordering::Relaxed),
             self.replay_packets_dropped.load(Ordering::Relaxed),
+            self.roaming_events.load(Ordering::Relaxed),
         )
     }
 }
@@ -162,6 +173,7 @@ mod tests {
         assert_eq!(m.handshakes_completed.load(Ordering::Relaxed), 0);
         assert_eq!(m.handshakes_failed.load(Ordering::Relaxed), 0);
         assert_eq!(m.replay_packets_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(m.roaming_events.load(Ordering::Relaxed), 0);
         assert_eq!(m.active_clients.load(Ordering::Relaxed), 0);
     }
 

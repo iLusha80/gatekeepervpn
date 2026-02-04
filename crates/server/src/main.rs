@@ -71,6 +71,8 @@ struct ConnectedClient {
     name: String,
     /// Last activity timestamp
     last_activity: Instant,
+    /// Current UDP endpoint (mutable — changes on roaming)
+    endpoint: SocketAddr,
 }
 
 /// Authorized peer info (from peers.toml)
@@ -84,10 +86,10 @@ struct AuthorizedPeer {
 struct Server {
     /// Server's private key
     private_key: Vec<u8>,
-    /// Connected clients by socket address
-    clients_by_addr: HashMap<SocketAddr, ConnectedClient>,
-    /// Map VPN IP -> socket address (for unicast routing)
-    ip_to_addr: HashMap<Ipv4Addr, SocketAddr>,
+    /// Connected clients by VPN IP (primary key)
+    clients: HashMap<Ipv4Addr, ConnectedClient>,
+    /// Reverse index: UDP endpoint -> VPN IP (for fast lookup)
+    endpoint_to_ip: HashMap<SocketAddr, Ipv4Addr>,
     /// Authorized peers (white list from peers.toml)
     authorized_peers: HashMap<[u8; 32], AuthorizedPeer>,
     /// Authorization enabled
@@ -102,13 +104,18 @@ impl Server {
     fn new(private_key: Vec<u8>, auth_enabled: bool) -> Self {
         Self {
             private_key,
-            clients_by_addr: HashMap::new(),
-            ip_to_addr: HashMap::new(),
+            clients: HashMap::new(),
+            endpoint_to_ip: HashMap::new(),
             authorized_peers: HashMap::new(),
             auth_enabled,
             cookie_state: CookieState::new(),
             rate_limiter: HandshakeRateLimiter::new(),
         }
+    }
+
+    /// Number of connected clients
+    fn client_count(&self) -> usize {
+        self.clients.len()
     }
 
     /// Load authorized peers from PeersConfig
@@ -245,9 +252,9 @@ impl Server {
             (name, assigned_ip)
         };
 
-        // Remove any existing mapping for this IP
-        if assigned_ip != Ipv4Addr::new(0, 0, 0, 0) {
-            self.ip_to_addr.insert(assigned_ip, addr);
+        // Remove old endpoint mapping if this IP was already connected
+        if let Some(old_client) = self.clients.get(&assigned_ip) {
+            self.endpoint_to_ip.remove(&old_client.endpoint);
         }
 
         let client = ConnectedClient {
@@ -255,44 +262,85 @@ impl Server {
             assigned_ip,
             name,
             last_activity: Instant::now(),
+            endpoint: addr,
         };
 
-        self.clients_by_addr.insert(addr, client);
+        if assigned_ip != Ipv4Addr::new(0, 0, 0, 0) {
+            self.clients.insert(assigned_ip, client);
+            self.endpoint_to_ip.insert(addr, assigned_ip);
+        }
     }
 
-    /// Remove a disconnected client
-    fn remove_client(&mut self, addr: &SocketAddr) {
-        if let Some(client) = self.clients_by_addr.remove(addr) {
-            self.ip_to_addr.remove(&client.assigned_ip);
+    /// Remove a disconnected client by VPN IP
+    fn remove_client_by_ip(&mut self, vpn_ip: &Ipv4Addr) {
+        if let Some(client) = self.clients.remove(vpn_ip) {
+            self.endpoint_to_ip.remove(&client.endpoint);
             log::info!(
                 "[{}] Client '{}' disconnected (IP: {})",
-                addr,
+                client.endpoint,
                 client.name,
                 client.assigned_ip
             );
         }
     }
 
+    /// Update client endpoint after roaming detection
+    fn update_client_endpoint(&mut self, vpn_ip: &Ipv4Addr, new_addr: SocketAddr) {
+        if let Some(client) = self.clients.get_mut(vpn_ip) {
+            let old_addr = client.endpoint;
+            self.endpoint_to_ip.remove(&old_addr);
+            client.endpoint = new_addr;
+            client.last_activity = Instant::now();
+            self.endpoint_to_ip.insert(new_addr, *vpn_ip);
+            log::info!(
+                "Roaming detected for '{}' (IP: {}): {} -> {}",
+                client.name,
+                vpn_ip,
+                old_addr,
+                new_addr
+            );
+        }
+    }
+
+    /// Try to find a client that can decrypt this payload (brute-force roaming detection)
+    fn detect_roaming(&self, payload: &[u8]) -> Option<Ipv4Addr> {
+        for (vpn_ip, client) in &self.clients {
+            if client.transport.can_decrypt(payload) {
+                return Some(*vpn_ip);
+            }
+        }
+        None
+    }
+
     /// Remove clients inactive for longer than the given timeout
     fn cleanup_inactive_clients(&mut self, timeout: Duration) -> usize {
         let now = Instant::now();
-        let inactive: Vec<SocketAddr> = self
-            .clients_by_addr
+        let inactive: Vec<Ipv4Addr> = self
+            .clients
             .iter()
             .filter(|(_, client)| now.duration_since(client.last_activity) > timeout)
-            .map(|(addr, _)| *addr)
+            .map(|(ip, _)| *ip)
             .collect();
 
         let count = inactive.len();
-        for addr in inactive {
-            self.remove_client(&addr);
+        for ip in inactive {
+            self.remove_client_by_ip(&ip);
         }
         count
     }
 
-    /// Get socket address for a VPN IP (unicast routing)
-    fn get_addr_for_ip(&self, ip: Ipv4Addr) -> Option<SocketAddr> {
-        self.ip_to_addr.get(&ip).copied()
+    /// Get client for a VPN IP (unicast routing)
+    fn get_client_for_ip(&self, ip: Ipv4Addr) -> Option<&ConnectedClient> {
+        self.clients.get(&ip)
+    }
+
+    /// Get client by endpoint address
+    fn get_client_by_endpoint_mut(&mut self, addr: &SocketAddr) -> Option<&mut ConnectedClient> {
+        if let Some(vpn_ip) = self.endpoint_to_ip.get(addr) {
+            self.clients.get_mut(vpn_ip)
+        } else {
+            None
+        }
     }
 }
 
@@ -402,7 +450,7 @@ async fn run_echo_mode(
                                 Ok((response, transport, peer)) => {
                                     server.register_client(addr, transport, peer);
                                     metrics.record_handshake_ok();
-                                    metrics.set_active_clients(server.clients_by_addr.len() as u64);
+                                    metrics.set_active_clients(server.client_count() as u64);
                                     Some(response)
                                 }
                                 Err(e) => {
@@ -432,9 +480,8 @@ async fn run_echo_mode(
                                         Ok((response, transport, peer)) => {
                                             server.register_client(addr, transport, peer);
                                             metrics.record_handshake_ok();
-                                            metrics.set_active_clients(
-                                                server.clients_by_addr.len() as u64,
-                                            );
+                                            metrics
+                                                .set_active_clients(server.client_count() as u64);
                                             Some(response)
                                         }
                                         Err(e) => {
@@ -461,64 +508,109 @@ async fn run_echo_mode(
                     None
                 }
                 PacketType::Data => {
-                    match server.clients_by_addr.get_mut(&addr) {
-                        Some(client) => {
-                            client.last_activity = Instant::now();
-                            metrics.record_received(packet.payload.len() as u64);
-                            match client.transport.decrypt(&packet.payload) {
-                                Ok(plaintext) => {
-                                    log::info!(
-                                        "[{}] Received: {} ({} bytes)",
-                                        addr,
-                                        String::from_utf8_lossy(&plaintext),
-                                        plaintext.len()
-                                    );
+                    // Fast path: known endpoint
+                    let client = server.get_client_by_endpoint_mut(&addr);
+                    if let Some(client) = client {
+                        client.last_activity = Instant::now();
+                        metrics.record_received(packet.payload.len() as u64);
+                        match client.transport.decrypt(&packet.payload) {
+                            Ok(plaintext) => {
+                                log::info!(
+                                    "[{}] Received: {} ({} bytes)",
+                                    addr,
+                                    String::from_utf8_lossy(&plaintext),
+                                    plaintext.len()
+                                );
 
-                                    // Echo back
-                                    let response_data =
-                                        format!("Echo: {}", String::from_utf8_lossy(&plaintext));
-                                    match client.transport.encrypt(response_data.as_bytes()) {
-                                        Ok(encrypted) => {
-                                            metrics.record_sent(encrypted.len() as u64);
-                                            Some(Packet::data(encrypted))
-                                        }
-                                        Err(e) => {
-                                            log::error!("[{}] Encrypt error: {}", addr, e);
-                                            None
-                                        }
+                                // Echo back
+                                let response_data =
+                                    format!("Echo: {}", String::from_utf8_lossy(&plaintext));
+                                match client.transport.encrypt(response_data.as_bytes()) {
+                                    Ok(encrypted) => {
+                                        metrics.record_sent(encrypted.len() as u64);
+                                        Some(Packet::data(encrypted))
                                     }
-                                }
-                                Err(e) => {
-                                    if matches!(e, CommonError::ReplayedPacket) {
-                                        error_loggers.decrypt_replay.debug(&format!(
-                                            "[{}] Replayed/out-of-order packet dropped",
-                                            addr
-                                        ));
-                                        metrics.record_replay();
-                                    } else {
-                                        error_loggers
-                                            .decrypt_crypto
-                                            .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                    Err(e) => {
+                                        log::error!("[{}] Encrypt error: {}", addr, e);
+                                        None
                                     }
-                                    None
                                 }
                             }
+                            Err(e) => {
+                                if matches!(e, CommonError::ReplayedPacket) {
+                                    error_loggers.decrypt_replay.debug(&format!(
+                                        "[{}] Replayed/out-of-order packet dropped",
+                                        addr
+                                    ));
+                                    metrics.record_replay();
+                                } else {
+                                    error_loggers
+                                        .decrypt_crypto
+                                        .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                }
+                                None
+                            }
                         }
-                        None => {
+                    } else {
+                        // Slow path: roaming detection via brute-force decrypt
+                        if let Some(vpn_ip) = server.detect_roaming(&packet.payload) {
+                            server.update_client_endpoint(&vpn_ip, addr);
+                            metrics.record_roaming();
+                            // Now decrypt normally
+                            if let Some(client) = server.clients.get_mut(&vpn_ip) {
+                                client.last_activity = Instant::now();
+                                metrics.record_received(packet.payload.len() as u64);
+                                match client.transport.decrypt(&packet.payload) {
+                                    Ok(plaintext) => {
+                                        log::info!(
+                                            "[{}] Received (roamed): {} ({} bytes)",
+                                            addr,
+                                            String::from_utf8_lossy(&plaintext),
+                                            plaintext.len()
+                                        );
+                                        let response_data = format!(
+                                            "Echo: {}",
+                                            String::from_utf8_lossy(&plaintext)
+                                        );
+                                        match client.transport.encrypt(response_data.as_bytes()) {
+                                            Ok(encrypted) => {
+                                                metrics.record_sent(encrypted.len() as u64);
+                                                Some(Packet::data(encrypted))
+                                            }
+                                            Err(e) => {
+                                                log::error!("[{}] Encrypt error: {}", addr, e);
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "[{}] Decrypt error after roaming: {}",
+                                            addr,
+                                            e
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
                             log::warn!("[{}] Data from unknown client", addr);
                             None
                         }
                     }
                 }
                 PacketType::KeepAlive => {
-                    if server.clients_by_addr.contains_key(&addr) {
-                        if let Some(client) = server.clients_by_addr.get_mut(&addr) {
-                            client.last_activity = Instant::now();
-                        }
+                    if let Some(client) = server.get_client_by_endpoint_mut(&addr) {
+                        client.last_activity = Instant::now();
                         log::debug!("[{}] KeepAlive received", addr);
                         Some(Packet::keep_alive_ack())
                     } else {
-                        log::warn!("[{}] KeepAlive from unknown client", addr);
+                        log::debug!(
+                            "[{}] KeepAlive from unknown endpoint (roaming pending)",
+                            addr
+                        );
                         None
                     }
                 }
@@ -723,8 +815,7 @@ async fn run_vpn_mode(
                                 Ok((response, transport, peer)) => {
                                     server.register_client(addr, transport, peer);
                                     metrics_rx.record_handshake_ok();
-                                    metrics_rx
-                                        .set_active_clients(server.clients_by_addr.len() as u64);
+                                    metrics_rx.set_active_clients(server.client_count() as u64);
                                     // Send junk packets before handshake response
                                     let junk_count = obfuscator_rx.junk_count();
                                     for _ in 0..junk_count {
@@ -766,9 +857,8 @@ async fn run_vpn_mode(
                                         Ok((response, transport, peer)) => {
                                             server.register_client(addr, transport, peer);
                                             metrics_rx.record_handshake_ok();
-                                            metrics_rx.set_active_clients(
-                                                server.clients_by_addr.len() as u64,
-                                            );
+                                            metrics_rx
+                                                .set_active_clients(server.client_count() as u64);
                                             // Send junk packets before handshake response
                                             let junk_count = obfuscator_rx.junk_count();
                                             for _ in 0..junk_count {
@@ -806,43 +896,80 @@ async fn run_vpn_mode(
                     log::warn!("[{}] Unexpected CookieReply from client", addr);
                 }
                 PacketType::Data => {
-                    if let Some(client) = server.clients_by_addr.get_mut(&addr) {
-                        client.last_activity = Instant::now();
-                        metrics_rx.record_received(packet.payload.len() as u64);
-                        match client.transport.decrypt(&packet.payload) {
-                            Ok(plaintext) => {
-                                log::debug!(
-                                    "[{}] {} UDP -> TUN: {} bytes",
-                                    addr,
-                                    client.name,
-                                    plaintext.len()
-                                );
-                                if let Err(e) = tun_writer.write(&plaintext).await {
-                                    loggers_rx
-                                        .tun_write
-                                        .warn(&format!("TUN write error: {}", e));
+                    // Fast path: known endpoint
+                    let known = server.endpoint_to_ip.contains_key(&addr);
+                    if known {
+                        if let Some(client) = server.get_client_by_endpoint_mut(&addr) {
+                            client.last_activity = Instant::now();
+                            metrics_rx.record_received(packet.payload.len() as u64);
+                            match client.transport.decrypt(&packet.payload) {
+                                Ok(plaintext) => {
+                                    log::debug!(
+                                        "[{}] {} UDP -> TUN: {} bytes",
+                                        addr,
+                                        client.name,
+                                        plaintext.len()
+                                    );
+                                    if let Err(e) = tun_writer.write(&plaintext).await {
+                                        loggers_rx
+                                            .tun_write
+                                            .warn(&format!("TUN write error: {}", e));
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                if matches!(e, CommonError::ReplayedPacket) {
-                                    loggers_rx.decrypt_replay.debug(&format!(
-                                        "[{}] Replayed/out-of-order packet dropped",
-                                        addr
-                                    ));
-                                    metrics_rx.record_replay();
-                                } else {
-                                    loggers_rx
-                                        .decrypt_crypto
-                                        .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                Err(e) => {
+                                    if matches!(e, CommonError::ReplayedPacket) {
+                                        loggers_rx.decrypt_replay.debug(&format!(
+                                            "[{}] Replayed/out-of-order packet dropped",
+                                            addr
+                                        ));
+                                        metrics_rx.record_replay();
+                                    } else {
+                                        loggers_rx
+                                            .decrypt_crypto
+                                            .warn(&format!("[{}] Decrypt error: {}", addr, e));
+                                    }
                                 }
                             }
                         }
                     } else {
-                        log::warn!("[{}] Data from unknown client", addr);
+                        // Slow path: roaming detection via brute-force decrypt
+                        if let Some(vpn_ip) = server.detect_roaming(&packet.payload) {
+                            server.update_client_endpoint(&vpn_ip, addr);
+                            metrics_rx.record_roaming();
+                            // Decrypt after roaming
+                            if let Some(client) = server.clients.get_mut(&vpn_ip) {
+                                client.last_activity = Instant::now();
+                                metrics_rx.record_received(packet.payload.len() as u64);
+                                match client.transport.decrypt(&packet.payload) {
+                                    Ok(plaintext) => {
+                                        log::debug!(
+                                            "[{}] {} UDP -> TUN (roamed): {} bytes",
+                                            addr,
+                                            client.name,
+                                            plaintext.len()
+                                        );
+                                        if let Err(e) = tun_writer.write(&plaintext).await {
+                                            loggers_rx
+                                                .tun_write
+                                                .warn(&format!("TUN write error: {}", e));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "[{}] Decrypt error after roaming: {}",
+                                            addr,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            log::warn!("[{}] Data from unknown client", addr);
+                        }
                     }
                 }
                 PacketType::KeepAlive => {
-                    if let Some(client) = server.clients_by_addr.get_mut(&addr) {
+                    if let Some(client) = server.get_client_by_endpoint_mut(&addr) {
                         client.last_activity = Instant::now();
                         log::debug!("[{}] {} KeepAlive received", addr, client.name);
                         let response = Packet::keep_alive_ack();
@@ -853,7 +980,10 @@ async fn run_vpn_mode(
                             log::error!("[{}] Failed to send KeepAliveAck: {}", addr, e);
                         }
                     } else {
-                        log::warn!("[{}] KeepAlive from unknown client", addr);
+                        log::debug!(
+                            "[{}] KeepAlive from unknown endpoint (roaming pending)",
+                            addr
+                        );
                     }
                 }
                 PacketType::KeepAliveAck => {
@@ -886,29 +1016,28 @@ async fn run_vpn_mode(
                 }
             };
 
-            let mut server = server_tx.lock().await;
+            let server = server_tx.lock().await;
 
             // Unicast: find the specific client for this destination IP
-            if let Some(addr) = server.get_addr_for_ip(dst_ip) {
-                if let Some(client) = server.clients_by_addr.get_mut(&addr) {
-                    match client.transport.encrypt(&buf[..n]) {
-                        Ok(encrypted) => {
-                            metrics_tx.record_sent(encrypted.len() as u64);
-                            let packet = Packet::data(encrypted);
-                            if let Err(e) = socket_tx
-                                .send_to(&obfuscator_tx.obfuscate(&packet), addr)
-                                .await
-                            {
-                                loggers_tx
-                                    .udp_send
-                                    .warn(&format!("[{}] UDP send error: {}", addr, e));
-                            } else {
-                                log::debug!("TUN -> UDP [{}] {}: {} bytes", addr, client.name, n);
-                            }
+            if let Some(client) = server.get_client_for_ip(dst_ip) {
+                let addr = client.endpoint;
+                match client.transport.encrypt(&buf[..n]) {
+                    Ok(encrypted) => {
+                        metrics_tx.record_sent(encrypted.len() as u64);
+                        let packet = Packet::data(encrypted);
+                        if let Err(e) = socket_tx
+                            .send_to(&obfuscator_tx.obfuscate(&packet), addr)
+                            .await
+                        {
+                            loggers_tx
+                                .udp_send
+                                .warn(&format!("[{}] UDP send error: {}", addr, e));
+                        } else {
+                            log::debug!("TUN -> UDP [{}] {}: {} bytes", addr, client.name, n);
                         }
-                        Err(e) => {
-                            log::error!("[{}] Encrypt error: {}", addr, e);
-                        }
+                    }
+                    Err(e) => {
+                        log::error!("[{}] Encrypt error: {}", addr, e);
                     }
                 }
             } else {
@@ -939,7 +1068,7 @@ async fn run_vpn_mode(
                     removed,
                     client_timeout
                 );
-                metrics_cleanup.set_active_clients(server.clients_by_addr.len() as u64);
+                metrics_cleanup.set_active_clients(server.client_count() as u64);
             }
         }
     });
@@ -992,7 +1121,7 @@ async fn run_vpn_mode(
         }
     }
 
-    let client_count = server_cleanup.lock().await.clients_by_addr.len();
+    let client_count = server_cleanup.lock().await.client_count();
     log::info!("Server stopped. {} client(s) were connected.", client_count);
 
     Ok(())

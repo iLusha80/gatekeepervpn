@@ -9,14 +9,14 @@ use bytes::Bytes;
 use clap::Parser;
 use tokio::net::UdpSocket;
 use tokio::signal;
-use tokio::sync::Mutex;
 use tokio::time::{interval, timeout};
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
     ClientConfig, DnsConfig, DnsState, Error as CommonError, Initiator, Packet, PacketObfuscator,
-    PacketType, RouteConfig, Transport, TunConfig, TunDevice, VpnErrorLoggers, VpnMetrics,
-    cleanup_dns, cleanup_routes, configure_socket, setup_dns, setup_routes,
+    PacketType, RouteConfig, Transport, TunConfig, TunDevice, TunReader, TunWriter,
+    VpnErrorLoggers, VpnMetrics, cleanup_dns, cleanup_routes, configure_socket, setup_dns,
+    setup_routes,
 };
 
 #[derive(Parser, Debug)]
@@ -245,10 +245,145 @@ impl ConnectionState {
     }
 }
 
-/// VPN mode: tunnel traffic through TUN interface
+/// Reason why the VPN data loop exited
+enum VpnExitReason {
+    /// Graceful shutdown (SIGINT/SIGTERM)
+    Shutdown,
+    /// KeepAlive timeout — try soft roam
+    ConnectionTimeout,
+}
+
+/// VPN data loop: tunnel traffic through TUN interface.
+/// Returns the reason for exiting.
+async fn run_vpn_loop(
+    socket: &UdpSocket,
+    transport: &Transport,
+    tun_reader: &mut TunReader,
+    tun_writer: &mut TunWriter,
+    keepalive_interval: u64,
+    keepalive_timeout: u64,
+    obfuscator: &PacketObfuscator,
+) -> VpnExitReason {
+    let conn_state = ConnectionState::new();
+    conn_state.update_last_received();
+
+    let metrics = VpnMetrics::new();
+    let error_loggers = VpnErrorLoggers::new();
+
+    let mut tun_buf = vec![0u8; 65535];
+    let mut udp_buf = vec![0u8; 65535];
+
+    let mut keepalive_ticker = interval(Duration::from_secs(if keepalive_interval > 0 {
+        keepalive_interval
+    } else {
+        3600 // effectively disabled
+    }));
+
+    if keepalive_interval > 0 {
+        log::info!(
+            "Keep-alive enabled: interval={}s, timeout={}s",
+            keepalive_interval,
+            keepalive_timeout
+        );
+    }
+
+    loop {
+        tokio::select! {
+            // TUN -> UDP (outgoing traffic)
+            result = tun_reader.read(&mut tun_buf) => {
+                match result {
+                    Ok(n) if n > 0 => {
+                        log::debug!("TUN -> UDP: {} bytes", n);
+                        match transport.encrypt(&tun_buf[..n]) {
+                            Ok(encrypted) => {
+                                metrics.record_sent(encrypted.len() as u64);
+                                let packet = Packet::data(encrypted);
+                                if let Err(e) = socket.send(&obfuscator.obfuscate(&packet)).await {
+                                    error_loggers.udp_send.warn(&format!("UDP send error: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Encrypt error: {}", e);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("TUN read error: {}", e);
+                        return VpnExitReason::Shutdown;
+                    }
+                }
+            }
+            // UDP -> TUN (incoming traffic)
+            result = socket.recv(&mut udp_buf) => {
+                match result {
+                    Ok(n) if n > 0 => {
+                        conn_state.update_last_received();
+                        if let Ok(packet) = obfuscator.deobfuscate(Bytes::copy_from_slice(&udp_buf[..n])) {
+                            match packet.packet_type {
+                                PacketType::Data => {
+                                    metrics.record_received(packet.payload.len() as u64);
+                                    match transport.decrypt(&packet.payload) {
+                                        Ok(plaintext) => {
+                                            log::debug!("UDP -> TUN: {} bytes", plaintext.len());
+                                            if let Err(e) = tun_writer.write(&plaintext).await {
+                                                error_loggers.tun_write.warn(&format!("TUN write error: {}", e));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if matches!(e, CommonError::ReplayedPacket) {
+                                                error_loggers.decrypt_replay.debug(&format!("Replayed/out-of-order packet dropped"));
+                                            } else {
+                                                error_loggers.decrypt_crypto.warn(&format!("Decrypt error: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                                PacketType::KeepAliveAck => {
+                                    log::debug!("KeepAliveAck received");
+                                }
+                                _ => {
+                                    log::warn!("Unexpected packet type: {:?}", packet.packet_type);
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("UDP recv error: {}", e);
+                        return VpnExitReason::Shutdown;
+                    }
+                }
+            }
+            // Keep-alive sender + timeout check
+            _ = keepalive_ticker.tick() => {
+                if keepalive_interval == 0 {
+                    continue;
+                }
+                let since_last = conn_state.seconds_since_last_received();
+                if since_last > keepalive_timeout {
+                    log::error!("Connection timeout: no response for {} seconds", since_last);
+                    return VpnExitReason::ConnectionTimeout;
+                }
+                let packet = Packet::keep_alive();
+                if let Err(e) = socket.send(&obfuscator.obfuscate(&packet)).await {
+                    log::error!("Failed to send keep-alive: {}", e);
+                } else {
+                    log::debug!("KeepAlive sent");
+                }
+            }
+            // Shutdown signal
+            _ = shutdown_signal() => {
+                return VpnExitReason::Shutdown;
+            }
+        }
+    }
+}
+
+/// VPN mode: setup TUN, routes, DNS, then run data loop with soft roaming support
 async fn run_vpn_mode(
     socket: Arc<UdpSocket>,
-    transport: Arc<Mutex<Transport>>,
+    transport: Arc<Transport>,
     config: &ClientConfig,
     obfuscator: Arc<PacketObfuscator>,
 ) -> Result<()> {
@@ -278,7 +413,6 @@ async fn run_vpn_mode(
         .and_then(|s| s.parse().ok())
         .context("Invalid server IP in config")?;
 
-    // Calculate VPN gateway IP (usually .1 in the VPN subnet)
     let vpn_gateway_ip = {
         let octets = tun_address.octets();
         Ipv4Addr::new(octets[0], octets[1], octets[2], 1)
@@ -320,184 +454,80 @@ async fn run_vpn_mode(
     // Split TUN device for concurrent read/write
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 
-    // Shared connection state
-    let conn_state = Arc::new(ConnectionState::new());
-    conn_state.update_last_received(); // Initial timestamp
-
-    // Metrics
-    let metrics = Arc::new(VpnMetrics::new());
-
-    // Rate-limited error loggers
-    let error_loggers = Arc::new(VpnErrorLoggers::new());
-
-    // Clone for tasks
-    let socket_tx = socket.clone();
-    let socket_rx = socket.clone();
-    let socket_ka = socket;
-    let transport_tx = transport.clone();
-    let transport_rx = transport;
-    let obfuscator_tx = obfuscator.clone();
-    let obfuscator_rx = obfuscator.clone();
-    let obfuscator_ka = obfuscator;
-    let conn_state_rx = conn_state.clone();
-    let conn_state_ka = conn_state;
-    let loggers_tx = error_loggers.clone();
-    let loggers_rx = error_loggers;
-    let metrics_tx = metrics.clone();
-    let metrics_rx = metrics;
-
     let keepalive_interval = config.keepalive_interval;
     let keepalive_timeout = config.keepalive_timeout;
+    let server_addr = config.server.clone();
 
-    // Task 1: TUN -> UDP (outgoing traffic)
-    let outgoing = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            // Read IP packet from TUN
-            let n = match tun_reader.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                Ok(_) => continue,
-                Err(e) => {
-                    log::error!("TUN read error: {}", e);
-                    break;
-                }
-            };
-
-            log::debug!("TUN -> UDP: {} bytes", n);
-
-            // Encrypt and send
-            let encrypted = {
-                let transport = transport_tx.lock().await;
-                match transport.encrypt(&buf[..n]) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::error!("Encrypt error: {}", e);
-                        continue;
-                    }
-                }
-            };
-
-            metrics_tx.record_sent(encrypted.len() as u64);
-            let packet = Packet::data(encrypted);
-            if let Err(e) = socket_tx.send(&obfuscator_tx.obfuscate(&packet)).await {
-                // Rate-limited warning for buffer overflow (common during bursts)
-                loggers_tx.udp_send.warn(&format!("UDP send error: {}", e));
-            }
-        }
-    });
-
-    // Task 2: UDP -> TUN (incoming traffic)
-    let incoming = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            // Receive encrypted packet from server
-            let n = match socket_rx.recv(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                Ok(_) => continue,
-                Err(e) => {
-                    log::error!("UDP recv error: {}", e);
-                    break;
-                }
-            };
-
-            // Update connection state
-            conn_state_rx.update_last_received();
-
-            // Decode packet
-            let packet = match obfuscator_rx.deobfuscate(Bytes::copy_from_slice(&buf[..n])) {
-                Ok(p) => p,
-                Err(_) => {
-                    // Could be a junk packet — silently ignore
-                    continue;
-                }
-            };
-
-            match packet.packet_type {
-                PacketType::Data => {
-                    metrics_rx.record_received(packet.payload.len() as u64);
-                    // Decrypt
-                    let plaintext = {
-                        let transport = transport_rx.lock().await;
-                        match transport.decrypt(&packet.payload) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                // Differentiate between replay and crypto errors
-                                if matches!(e, CommonError::ReplayedPacket) {
-                                    // Replayed/out-of-order packets are normal in UDP
-                                    loggers_rx
-                                        .decrypt_replay
-                                        .debug(&format!("Replayed/out-of-order packet dropped"));
-                                } else {
-                                    // Actual crypto errors are more concerning
-                                    loggers_rx
-                                        .decrypt_crypto
-                                        .warn(&format!("Decrypt error: {}", e));
-                                }
-                                continue;
-                            }
-                        }
-                    };
-
-                    log::debug!("UDP -> TUN: {} bytes", plaintext.len());
-
-                    // Write to TUN
-                    if let Err(e) = tun_writer.write(&plaintext).await {
-                        loggers_rx
-                            .tun_write
-                            .warn(&format!("TUN write error: {}", e));
-                    }
-                }
-                PacketType::KeepAliveAck => {
-                    log::debug!("KeepAliveAck received");
-                }
-                _ => {
-                    log::warn!("Unexpected packet type: {:?}", packet.packet_type);
-                }
-            }
-        }
-    });
-
-    // Task 3: Keep-alive sender
-    let keepalive = tokio::spawn(async move {
-        if keepalive_interval == 0 {
-            log::info!("Keep-alive disabled");
-            return;
-        }
-
-        log::info!(
-            "Keep-alive enabled: interval={}s, timeout={}s",
+    // Soft roam loop: on timeout, recreate socket and retry with same transport
+    let mut current_socket = socket;
+    loop {
+        let reason = run_vpn_loop(
+            &current_socket,
+            &transport,
+            &mut tun_reader,
+            &mut tun_writer,
             keepalive_interval,
-            keepalive_timeout
-        );
+            keepalive_timeout,
+            &obfuscator,
+        )
+        .await;
 
-        let mut ticker = interval(Duration::from_secs(keepalive_interval));
+        match reason {
+            VpnExitReason::Shutdown => break,
+            VpnExitReason::ConnectionTimeout => {
+                log::info!("Attempting soft roam (new socket, same session)...");
 
-        loop {
-            ticker.tick().await;
+                // Create new UDP socket
+                let new_socket = match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to create new socket for roaming: {}", e);
+                        break;
+                    }
+                };
+                if let Err(e) = new_socket.connect(&server_addr).await {
+                    log::error!("Failed to connect new socket: {}", e);
+                    break;
+                }
+                if let Err(e) = configure_socket(&new_socket) {
+                    log::warn!("Failed to configure new socket buffers: {}", e);
+                }
 
-            // Check timeout
-            let since_last = conn_state_ka.seconds_since_last_received();
-            if since_last > keepalive_timeout {
-                log::error!("Connection timeout: no response for {} seconds", since_last);
-                break;
-            }
+                // Send roam ping — encrypted empty Data packet to trigger roaming detection on server
+                match transport.encrypt(b"") {
+                    Ok(encrypted) => {
+                        let ping = Packet::data(encrypted);
+                        if let Err(e) = new_socket.send(&obfuscator.obfuscate(&ping)).await {
+                            log::error!("Failed to send roam ping: {}", e);
+                            break;
+                        }
+                        log::info!("Roam ping sent, waiting for server response...");
+                    }
+                    Err(e) => {
+                        log::error!("Failed to encrypt roam ping: {}", e);
+                        break;
+                    }
+                }
 
-            // Send keep-alive
-            let packet = Packet::keep_alive();
-            if let Err(e) = socket_ka.send(&obfuscator_ka.obfuscate(&packet)).await {
-                log::error!("Failed to send keep-alive: {}", e);
-            } else {
-                log::debug!("KeepAlive sent");
+                // Wait for response with short timeout
+                let mut buf = [0u8; 65535];
+                match timeout(Duration::from_secs(5), new_socket.recv(&mut buf)).await {
+                    Ok(Ok(_)) => {
+                        log::info!("Soft roam successful — server responded on new endpoint");
+                        current_socket = Arc::new(new_socket);
+                        // Continue loop — will restart run_vpn_loop with new socket
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("Soft roam failed (recv error): {}", e);
+                        break;
+                    }
+                    Err(_) => {
+                        log::warn!("Soft roam failed (timeout) — falling back to re-handshake");
+                        break;
+                    }
+                }
             }
         }
-    });
-
-    // Wait for any task to finish or shutdown signal
-    tokio::select! {
-        _ = outgoing => log::error!("Outgoing task finished unexpectedly"),
-        _ = incoming => log::error!("Incoming task finished unexpectedly"),
-        _ = keepalive => log::error!("Keep-alive task finished (connection timeout)"),
-        _ = shutdown_signal() => {}
     }
 
     // Cleanup DNS
@@ -546,9 +576,9 @@ async fn run_vpn_connection(
     // Perform handshake
     let transport = perform_handshake(&socket, private_key, server_public_key, &obfuscator).await?;
 
-    // VPN mode
+    // VPN mode with soft roaming support
     let socket = Arc::new(socket);
-    let transport = Arc::new(Mutex::new(transport));
+    let transport = Arc::new(transport);
     run_vpn_mode(socket, transport, config, obfuscator).await
 }
 
