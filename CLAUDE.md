@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 * Используй `context7` MCP tool для проверки актуальной документации библиотек
 * При предложении кода учитывать тестируемость и дальнейшую интеграцию в GUI (macOS / iOS)
 
+Подробная архитектура и карта файлов: [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ---
 
 ## Build & Development Commands
@@ -80,7 +82,8 @@ Server:  UDP recv → decrypt → TUN write → kernel routing → response
 
 **Клиент:**
 - `run_vpn_loop` возвращает `VpnExitReason` (Shutdown / ConnectionTimeout)
-- При timeout → новый UDP socket → roam ping (encrypted empty Data) → retry
+- Мгновенное обнаружение потери сети: EADDRNOTAVAIL / NetworkUnreachable → немедленный roam (без ожидания keepalive timeout)
+- При roam: пауза 500мс → `update_server_route()` (новый default gateway) → новый UDP socket → roam ping → retry
 - Если soft roam не удался → fallback на полный re-handshake
 
 ### Серверная архитектура (известное ограничение)

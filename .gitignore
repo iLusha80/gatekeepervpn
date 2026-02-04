@@ -5,6 +5,7 @@
 !README.md
 !CLAUDE.md
 !ROADMAP.md
+!ARCHITECTURE.md
 
 # Deploy config (contains server SSH address)
 .deploy.conf
