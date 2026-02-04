@@ -65,8 +65,6 @@ struct Args {
 struct ConnectedClient {
     /// Transport state for encryption/decryption
     transport: Transport,
-    /// Client's public key
-    public_key: [u8; 32],
     /// Assigned VPN IP address
     assigned_ip: Ipv4Addr,
     /// Client name from peers.toml
@@ -79,7 +77,6 @@ struct ConnectedClient {
 #[derive(Clone)]
 struct AuthorizedPeer {
     name: String,
-    public_key: [u8; 32],
     assigned_ip: Ipv4Addr,
 }
 
@@ -128,7 +125,6 @@ impl Server {
                         key_array,
                         AuthorizedPeer {
                             name: peer.name.clone(),
-                            public_key: key_array,
                             assigned_ip: peer.assigned_ip,
                         },
                     );
@@ -238,7 +234,6 @@ impl Server {
         &mut self,
         addr: SocketAddr,
         transport: Transport,
-        public_key: [u8; 32],
         peer: Option<AuthorizedPeer>,
     ) {
         let (name, assigned_ip) = if let Some(p) = peer {
@@ -257,7 +252,6 @@ impl Server {
 
         let client = ConnectedClient {
             transport,
-            public_key,
             assigned_ip,
             name,
             last_activity: Instant::now(),
@@ -406,11 +400,7 @@ async fn run_echo_mode(
                             server.rate_limiter.record(&client_ip);
                             match server.handle_handshake(addr, &packet.payload) {
                                 Ok((response, transport, peer)) => {
-                                    let mut key_array = [0u8; 32];
-                                    if let Some(ref p) = peer {
-                                        key_array = p.public_key;
-                                    }
-                                    server.register_client(addr, transport, key_array, peer);
+                                    server.register_client(addr, transport, peer);
                                     metrics.record_handshake_ok();
                                     metrics.set_active_clients(server.clients_by_addr.len() as u64);
                                     Some(response)
@@ -440,12 +430,7 @@ async fn run_echo_mode(
                                     server.rate_limiter.record(&client_ip);
                                     match server.handle_handshake(addr, &handshake_payload) {
                                         Ok((response, transport, peer)) => {
-                                            let mut key_array = [0u8; 32];
-                                            if let Some(ref p) = peer {
-                                                key_array = p.public_key;
-                                            }
-                                            server
-                                                .register_client(addr, transport, key_array, peer);
+                                            server.register_client(addr, transport, peer);
                                             metrics.record_handshake_ok();
                                             metrics.set_active_clients(
                                                 server.clients_by_addr.len() as u64,
@@ -736,11 +721,7 @@ async fn run_vpn_mode(
                             server.rate_limiter.record(&client_ip);
                             match server.handle_handshake(addr, &packet.payload) {
                                 Ok((response, transport, peer)) => {
-                                    let mut key_array = [0u8; 32];
-                                    if let Some(ref p) = peer {
-                                        key_array = p.public_key;
-                                    }
-                                    server.register_client(addr, transport, key_array, peer);
+                                    server.register_client(addr, transport, peer);
                                     metrics_rx.record_handshake_ok();
                                     metrics_rx
                                         .set_active_clients(server.clients_by_addr.len() as u64);
@@ -783,12 +764,7 @@ async fn run_vpn_mode(
                                     server.rate_limiter.record(&client_ip);
                                     match server.handle_handshake(addr, &handshake_payload) {
                                         Ok((response, transport, peer)) => {
-                                            let mut key_array = [0u8; 32];
-                                            if let Some(ref p) = peer {
-                                                key_array = p.public_key;
-                                            }
-                                            server
-                                                .register_client(addr, transport, key_array, peer);
+                                            server.register_client(addr, transport, peer);
                                             metrics_rx.record_handshake_ok();
                                             metrics_rx.set_active_clients(
                                                 server.clients_by_addr.len() as u64,
