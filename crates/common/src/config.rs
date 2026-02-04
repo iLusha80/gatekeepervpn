@@ -122,6 +122,58 @@ impl Default for PeersConfig {
 }
 
 // ============================================================================
+// Obfuscation Configuration
+// ============================================================================
+
+/// Configuration for UDP packet obfuscation (anti-DPI)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObfuscationConfig {
+    /// Enable obfuscation
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pre-shared key for header encryption (base64, 32 bytes)
+    #[serde(default)]
+    pub psk: String,
+    /// Random header size prepended to each packet
+    #[serde(default)]
+    pub header_size: usize,
+    /// Minimum random padding appended to each packet
+    #[serde(default)]
+    pub min_padding: usize,
+    /// Maximum random padding appended to each packet
+    #[serde(default = "default_max_padding")]
+    pub max_padding: usize,
+    /// Minimum junk packets during handshake
+    #[serde(default)]
+    pub junk_min: u8,
+    /// Maximum junk packets during handshake
+    #[serde(default = "default_junk_max")]
+    pub junk_max: u8,
+}
+
+fn default_max_padding() -> usize {
+    32
+}
+
+fn default_junk_max() -> u8 {
+    3
+}
+
+impl Default for ObfuscationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            psk: String::new(),
+            header_size: 0,
+            min_padding: 0,
+            max_padding: default_max_padding(),
+            junk_min: 0,
+            junk_max: default_junk_max(),
+        }
+    }
+}
+
+// ============================================================================
 // Server Configuration
 // ============================================================================
 
@@ -153,6 +205,9 @@ pub struct ServerConfig {
     /// Path to stats file for metrics JSON output
     #[serde(default = "default_stats_file")]
     pub stats_file: String,
+    /// Obfuscation settings
+    #[serde(default)]
+    pub obfuscation: ObfuscationConfig,
 }
 
 fn default_server_tun_address() -> String {
@@ -206,6 +261,7 @@ impl Default for ServerConfig {
             enable_nat: default_enable_nat(),
             client_timeout: default_client_timeout(),
             stats_file: default_stats_file(),
+            obfuscation: ObfuscationConfig::default(),
         }
     }
 }
@@ -252,6 +308,9 @@ pub struct ClientConfig {
     /// DNS servers to use when VPN is connected
     #[serde(default)]
     pub dns_servers: Vec<String>,
+    /// Obfuscation settings
+    #[serde(default)]
+    pub obfuscation: ObfuscationConfig,
 }
 
 fn default_tun_address() -> String {
@@ -303,6 +362,7 @@ impl Default for ClientConfig {
             reconnect_delay: default_reconnect_delay(),
             max_reconnect_attempts: default_max_reconnect_attempts(),
             dns_servers: vec![],
+            obfuscation: ObfuscationConfig::default(),
         }
     }
 }
@@ -401,5 +461,83 @@ mod tests {
         "#;
         let config: ClientConfig = toml::from_str(toml_str).unwrap();
         assert!(config.dns_servers.is_empty());
+    }
+
+    #[test]
+    fn test_obfuscation_config_default() {
+        let config = ObfuscationConfig::default();
+        assert!(!config.enabled);
+        assert!(config.psk.is_empty());
+        assert_eq!(config.header_size, 0);
+        assert_eq!(config.min_padding, 0);
+        assert_eq!(config.max_padding, 32);
+        assert_eq!(config.junk_min, 0);
+        assert_eq!(config.junk_max, 3);
+    }
+
+    #[test]
+    fn test_obfuscation_config_deserialize() {
+        let toml_str = r#"
+            enabled = true
+            psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            header_size = 4
+            min_padding = 16
+            max_padding = 64
+            junk_min = 1
+            junk_max = 5
+        "#;
+        let config: ObfuscationConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.header_size, 4);
+        assert_eq!(config.min_padding, 16);
+        assert_eq!(config.max_padding, 64);
+        assert_eq!(config.junk_min, 1);
+        assert_eq!(config.junk_max, 5);
+    }
+
+    #[test]
+    fn test_server_config_with_obfuscation() {
+        let toml_str = r#"
+            listen = "0.0.0.0:51820"
+            private_key = "test"
+
+            [obfuscation]
+            enabled = true
+            psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            header_size = 8
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.obfuscation.enabled);
+        assert_eq!(config.obfuscation.header_size, 8);
+        assert_eq!(config.obfuscation.max_padding, 32); // default
+    }
+
+    #[test]
+    fn test_server_config_without_obfuscation() {
+        let toml_str = r#"
+            listen = "0.0.0.0:51820"
+            private_key = "test"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.obfuscation.enabled);
+    }
+
+    #[test]
+    fn test_client_config_with_obfuscation() {
+        let toml_str = r#"
+            server = "1.2.3.4:51820"
+            private_key = "test"
+            server_public_key = "test"
+
+            [obfuscation]
+            enabled = true
+            psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            min_padding = 8
+            max_padding = 128
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.obfuscation.enabled);
+        assert_eq!(config.obfuscation.min_padding, 8);
+        assert_eq!(config.obfuscation.max_padding, 128);
     }
 }

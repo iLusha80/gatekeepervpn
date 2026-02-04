@@ -27,3 +27,14 @@ enable_nat = true
 
 # Stats file path (used with --stats flag)
 # stats_file = "/tmp/gatekeeper-vpn.stats"
+
+# Obfuscation (anti-DPI). Must match on server and client.
+# Generate PSK: gkvpn generate-psk
+# [obfuscation]
+# enabled = true
+# psk = "base64-encoded-32-byte-key"
+# header_size = 4
+# min_padding = 16
+# max_padding = 64
+# junk_min = 1
+# junk_max = 3

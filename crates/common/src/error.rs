@@ -31,4 +31,7 @@ pub enum Error {
 
     #[error("DNS error: {0}")]
     Dns(String),
+
+    #[error("obfuscation error: {0}")]
+    Obfuscation(String),
 }

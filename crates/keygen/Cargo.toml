@@ -16,3 +16,4 @@ toml.workspace = true
 anyhow.workspace = true
 x25519-dalek.workspace = true
 chrono.workspace = true
+rand.workspace = true

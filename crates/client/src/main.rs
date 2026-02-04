@@ -14,9 +14,9 @@ use tokio::time::{interval, timeout};
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    ClientConfig, DnsConfig, DnsState, Error as CommonError, Initiator, Packet, PacketType,
-    RouteConfig, Transport, TunConfig, TunDevice, VpnErrorLoggers, VpnMetrics, cleanup_dns,
-    cleanup_routes, configure_socket, setup_dns, setup_routes,
+    ClientConfig, DnsConfig, DnsState, Error as CommonError, Initiator, Packet, PacketObfuscator,
+    PacketType, RouteConfig, Transport, TunConfig, TunDevice, VpnErrorLoggers, VpnMetrics,
+    cleanup_dns, cleanup_routes, configure_socket, setup_dns, setup_routes,
 };
 
 #[derive(Parser, Debug)]
@@ -74,27 +74,47 @@ fn load_config(path: &str) -> Result<ClientConfig> {
     }
 }
 
-async fn recv_packet(socket: &UdpSocket, timeout_duration: Duration) -> Result<Packet> {
+async fn recv_packet(
+    socket: &UdpSocket,
+    timeout_duration: Duration,
+    obfuscator: &PacketObfuscator,
+) -> Result<Packet> {
     let mut buf = vec![0u8; 65535];
 
-    let len = timeout(timeout_duration, socket.recv(&mut buf))
-        .await
-        .context("Receive timeout")?
-        .context("Failed to receive packet")?;
+    loop {
+        let len = timeout(timeout_duration, socket.recv(&mut buf))
+            .await
+            .context("Receive timeout")?
+            .context("Failed to receive packet")?;
 
-    let data = Bytes::copy_from_slice(&buf[..len]);
-    Packet::decode(data).context("Failed to decode packet")
+        let data = Bytes::copy_from_slice(&buf[..len]);
+        match obfuscator.deobfuscate(data) {
+            Ok(p) => return Ok(p),
+            Err(_) => {
+                // Could be a junk packet — silently ignore and wait for next
+                continue;
+            }
+        }
+    }
 }
 
 async fn perform_handshake(
     socket: &UdpSocket,
     private_key: &[u8],
     server_public_key: &[u8],
+    obfuscator: &PacketObfuscator,
 ) -> Result<Transport> {
     log::info!("Starting handshake...");
 
     let mut initiator =
         Initiator::new(private_key, server_public_key).context("Failed to create initiator")?;
+
+    // Send junk packets before handshake init
+    let junk_count = obfuscator.junk_count();
+    for _ in 0..junk_count {
+        let junk = obfuscator.generate_junk_packet();
+        let _ = socket.send(&junk).await;
+    }
 
     // Send handshake init
     let init_msg = initiator
@@ -103,12 +123,12 @@ async fn perform_handshake(
     let init_packet = Packet::handshake_init(init_msg.clone());
 
     socket
-        .send(&init_packet.encode())
+        .send(&obfuscator.obfuscate(&init_packet))
         .await
         .context("Failed to send handshake init")?;
 
     // Receive response (may be HandshakeResponse or CookieReply)
-    let response_packet = recv_packet(socket, HANDSHAKE_TIMEOUT)
+    let response_packet = recv_packet(socket, HANDSHAKE_TIMEOUT, obfuscator)
         .await
         .context("Failed to receive handshake response")?;
 
@@ -124,12 +144,12 @@ async fn perform_handshake(
 
         let cookie_packet = Packet::handshake_init_cookie(cookie, init_msg);
         socket
-            .send(&cookie_packet.encode())
+            .send(&obfuscator.obfuscate(&cookie_packet))
             .await
             .context("Failed to send handshake init with cookie")?;
 
         // Wait for actual HandshakeResponse
-        recv_packet(socket, HANDSHAKE_TIMEOUT)
+        recv_packet(socket, HANDSHAKE_TIMEOUT, obfuscator)
             .await
             .context("Failed to receive handshake response after cookie")?
     } else {
@@ -160,7 +180,12 @@ async fn perform_handshake(
 }
 
 /// Test mode: send a message and receive echo
-async fn run_test_mode(socket: &UdpSocket, transport: &mut Transport, message: &str) -> Result<()> {
+async fn run_test_mode(
+    socket: &UdpSocket,
+    transport: &mut Transport,
+    message: &str,
+    obfuscator: &PacketObfuscator,
+) -> Result<()> {
     log::info!("Test mode: sending message: {}", message);
 
     let encrypted = transport
@@ -169,12 +194,12 @@ async fn run_test_mode(socket: &UdpSocket, transport: &mut Transport, message: &
     let data_packet = Packet::data(encrypted);
 
     socket
-        .send(&data_packet.encode())
+        .send(&obfuscator.obfuscate(&data_packet))
         .await
         .context("Failed to send data")?;
 
     // Receive echo response
-    let echo_packet = recv_packet(socket, Duration::from_secs(10))
+    let echo_packet = recv_packet(socket, Duration::from_secs(10), obfuscator)
         .await
         .context("Failed to receive echo response")?;
 
@@ -225,6 +250,7 @@ async fn run_vpn_mode(
     socket: Arc<UdpSocket>,
     transport: Arc<Mutex<Transport>>,
     config: &ClientConfig,
+    obfuscator: Arc<PacketObfuscator>,
 ) -> Result<()> {
     // Parse TUN config
     let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
@@ -310,6 +336,9 @@ async fn run_vpn_mode(
     let socket_ka = socket;
     let transport_tx = transport.clone();
     let transport_rx = transport;
+    let obfuscator_tx = obfuscator.clone();
+    let obfuscator_rx = obfuscator.clone();
+    let obfuscator_ka = obfuscator;
     let conn_state_rx = conn_state.clone();
     let conn_state_ka = conn_state;
     let loggers_tx = error_loggers.clone();
@@ -350,7 +379,7 @@ async fn run_vpn_mode(
 
             metrics_tx.record_sent(encrypted.len() as u64);
             let packet = Packet::data(encrypted);
-            if let Err(e) = socket_tx.send(&packet.encode()).await {
+            if let Err(e) = socket_tx.send(&obfuscator_tx.obfuscate(&packet)).await {
                 // Rate-limited warning for buffer overflow (common during bursts)
                 loggers_tx.udp_send.warn(&format!("UDP send error: {}", e));
             }
@@ -375,10 +404,10 @@ async fn run_vpn_mode(
             conn_state_rx.update_last_received();
 
             // Decode packet
-            let packet = match Packet::decode(Bytes::copy_from_slice(&buf[..n])) {
+            let packet = match obfuscator_rx.deobfuscate(Bytes::copy_from_slice(&buf[..n])) {
                 Ok(p) => p,
-                Err(e) => {
-                    log::warn!("Invalid packet: {}", e);
+                Err(_) => {
+                    // Could be a junk packet — silently ignore
                     continue;
                 }
             };
@@ -455,7 +484,7 @@ async fn run_vpn_mode(
 
             // Send keep-alive
             let packet = Packet::keep_alive();
-            if let Err(e) = socket_ka.send(&packet.encode()).await {
+            if let Err(e) = socket_ka.send(&obfuscator_ka.obfuscate(&packet)).await {
                 log::error!("Failed to send keep-alive: {}", e);
             } else {
                 log::debug!("KeepAlive sent");
@@ -498,6 +527,7 @@ async fn run_vpn_connection(
     config: &ClientConfig,
     private_key: &[u8],
     server_public_key: &[u8],
+    obfuscator: Arc<PacketObfuscator>,
 ) -> Result<()> {
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -514,12 +544,12 @@ async fn run_vpn_connection(
     log::info!("Connecting to server: {}", config.server);
 
     // Perform handshake
-    let transport = perform_handshake(&socket, private_key, server_public_key).await?;
+    let transport = perform_handshake(&socket, private_key, server_public_key, &obfuscator).await?;
 
     // VPN mode
     let socket = Arc::new(socket);
     let transport = Arc::new(Mutex::new(transport));
-    run_vpn_mode(socket, transport, config).await
+    run_vpn_mode(socket, transport, config, obfuscator).await
 }
 
 #[tokio::main]
@@ -552,6 +582,21 @@ async fn main() -> Result<()> {
     let server_public_key =
         keys::decode(&config.server_public_key).context("Invalid server public key format")?;
 
+    // Create obfuscator
+    let obfuscator = Arc::new(
+        PacketObfuscator::new(&config.obfuscation).context("Failed to create packet obfuscator")?,
+    );
+    if config.obfuscation.enabled {
+        log::info!(
+            "Packet obfuscation enabled (header_size={}, padding={}-{}, junk={}-{})",
+            config.obfuscation.header_size,
+            config.obfuscation.min_padding,
+            config.obfuscation.max_padding,
+            config.obfuscation.junk_min,
+            config.obfuscation.junk_max
+        );
+    }
+
     if args.test {
         // Test mode - single connection, no reconnect
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -562,8 +607,9 @@ async fn main() -> Result<()> {
 
         log::info!("Connecting to server: {}", config.server);
 
-        let mut transport = perform_handshake(&socket, &private_key, &server_public_key).await?;
-        run_test_mode(&socket, &mut transport, &args.message).await?;
+        let mut transport =
+            perform_handshake(&socket, &private_key, &server_public_key, &obfuscator).await?;
+        run_test_mode(&socket, &mut transport, &args.message, &obfuscator).await?;
     } else {
         // VPN mode with reconnection support
         let mut attempt = 0u32;
@@ -591,7 +637,14 @@ async fn main() -> Result<()> {
                 );
             }
 
-            match run_vpn_connection(&config, &private_key, &server_public_key).await {
+            match run_vpn_connection(
+                &config,
+                &private_key,
+                &server_public_key,
+                obfuscator.clone(),
+            )
+            .await
+            {
                 Ok(()) => {
                     log::info!("VPN connection ended normally");
                     break;

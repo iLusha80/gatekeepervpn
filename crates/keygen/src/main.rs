@@ -135,6 +135,9 @@ enum Commands {
         name: String,
     },
 
+    /// Generate a pre-shared key for obfuscation (32 random bytes, base64)
+    GeneratePsk,
+
     /// Show VPN server status (reads stats file)
     Status {
         /// Path to stats file
@@ -181,8 +184,24 @@ fn main() -> Result<()> {
 
         Commands::Show { name } => show_client(&cli.config_dir, name),
 
+        Commands::GeneratePsk => generate_psk(),
+
         Commands::Status { stats_file } => show_status(&stats_file),
     }
+}
+
+// ============================================================================
+// PSK generation
+// ============================================================================
+
+fn generate_psk() -> Result<()> {
+    use rand::RngCore;
+    let mut psk = [0u8; 32];
+    rand::rng().fill_bytes(&mut psk);
+    let encoded = keys::encode(&psk);
+    println!("{}", encoded);
+    eprintln!("Add this to [obfuscation] section as 'psk' in both server and client configs.");
+    Ok(())
 }
 
 // ============================================================================

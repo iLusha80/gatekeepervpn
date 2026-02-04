@@ -21,9 +21,9 @@ use tokio::time::interval;
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    CookieState, Error as CommonError, HandshakeRateLimiter, NatConfig, Packet, PacketType,
-    PeersConfig, RateLimitDecision, Responder, ServerConfig, Transport, TunConfig, TunDevice,
-    VpnErrorLoggers, VpnMetrics, cleanup_nat, configure_socket, enable_ip_forwarding,
+    CookieState, Error as CommonError, HandshakeRateLimiter, NatConfig, Packet, PacketObfuscator,
+    PacketType, PeersConfig, RateLimitDecision, Responder, ServerConfig, Transport, TunConfig,
+    TunDevice, VpnErrorLoggers, VpnMetrics, cleanup_nat, configure_socket, enable_ip_forwarding,
     get_destination_ip, print_nat_instructions, setup_nat,
 };
 
@@ -358,6 +358,7 @@ async fn run_echo_mode(
     socket: Arc<UdpSocket>,
     server: Arc<Mutex<Server>>,
     metrics: Arc<VpnMetrics>,
+    obfuscator: Arc<PacketObfuscator>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     let error_loggers = VpnErrorLoggers::new();
@@ -373,10 +374,10 @@ async fn run_echo_mode(
         };
         let data = Bytes::copy_from_slice(&buf[..len]);
 
-        let packet = match Packet::decode(data) {
+        let packet = match obfuscator.deobfuscate(data) {
             Ok(p) => p,
-            Err(e) => {
-                log::warn!("[{}] Invalid packet: {}", addr, e);
+            Err(_) => {
+                // Could be a junk packet — silently ignore
                 continue;
             }
         };
@@ -544,7 +545,18 @@ async fn run_echo_mode(
         };
 
         if let Some(response_packet) = response {
-            if let Err(e) = socket.send_to(&response_packet.encode(), addr).await {
+            // Send junk packets before handshake response
+            if response_packet.packet_type == PacketType::HandshakeResponse {
+                let junk_count = obfuscator.junk_count();
+                for _ in 0..junk_count {
+                    let junk = obfuscator.generate_junk_packet();
+                    let _ = socket.send_to(&junk, addr).await;
+                }
+            }
+            if let Err(e) = socket
+                .send_to(&obfuscator.obfuscate(&response_packet), addr)
+                .await
+            {
                 log::error!("[{}] Failed to send response: {}", addr, e);
             }
         }
@@ -559,6 +571,7 @@ async fn run_vpn_mode(
     peers_path: PathBuf,
     metrics: Arc<VpnMetrics>,
     enable_stats: bool,
+    obfuscator: Arc<PacketObfuscator>,
 ) -> Result<()> {
     // Parse TUN config
     let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
@@ -639,6 +652,8 @@ async fn run_vpn_mode(
     let metrics_tx = metrics.clone();
     let metrics_cleanup = metrics.clone();
     let metrics_stats = metrics.clone();
+    let obfuscator_rx = obfuscator.clone();
+    let obfuscator_tx = obfuscator;
 
     let client_timeout = config.client_timeout;
     let stats_file = config.stats_file.clone();
@@ -685,10 +700,10 @@ async fn run_vpn_mode(
             };
 
             let data = Bytes::copy_from_slice(&buf[..len]);
-            let packet = match Packet::decode(data) {
+            let packet = match obfuscator_rx.deobfuscate(data) {
                 Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[{}] Invalid packet: {}", addr, e);
+                Err(_) => {
+                    // Could be a junk packet — silently ignore
                     continue;
                 }
             };
@@ -710,7 +725,10 @@ async fn run_vpn_mode(
                             let cookie = server.cookie_state.generate_cookie(&client_ip);
                             server.rate_limiter.record(&client_ip);
                             let reply = Packet::cookie_reply(cookie);
-                            if let Err(e) = socket_rx.send_to(&reply.encode(), addr).await {
+                            if let Err(e) = socket_rx
+                                .send_to(&obfuscator_rx.obfuscate(&reply), addr)
+                                .await
+                            {
                                 log::error!("[{}] Failed to send cookie reply: {}", addr, e);
                             }
                         }
@@ -726,8 +744,15 @@ async fn run_vpn_mode(
                                     metrics_rx.record_handshake_ok();
                                     metrics_rx
                                         .set_active_clients(server.clients_by_addr.len() as u64);
-                                    if let Err(e) =
-                                        socket_rx.send_to(&response.encode(), addr).await
+                                    // Send junk packets before handshake response
+                                    let junk_count = obfuscator_rx.junk_count();
+                                    for _ in 0..junk_count {
+                                        let junk = obfuscator_rx.generate_junk_packet();
+                                        let _ = socket_rx.send_to(&junk, addr).await;
+                                    }
+                                    if let Err(e) = socket_rx
+                                        .send_to(&obfuscator_rx.obfuscate(&response), addr)
+                                        .await
                                     {
                                         log::error!(
                                             "[{}] Failed to send handshake response: {}",
@@ -768,8 +793,15 @@ async fn run_vpn_mode(
                                             metrics_rx.set_active_clients(
                                                 server.clients_by_addr.len() as u64,
                                             );
-                                            if let Err(e) =
-                                                socket_rx.send_to(&response.encode(), addr).await
+                                            // Send junk packets before handshake response
+                                            let junk_count = obfuscator_rx.junk_count();
+                                            for _ in 0..junk_count {
+                                                let junk = obfuscator_rx.generate_junk_packet();
+                                                let _ = socket_rx.send_to(&junk, addr).await;
+                                            }
+                                            if let Err(e) = socket_rx
+                                                .send_to(&obfuscator_rx.obfuscate(&response), addr)
+                                                .await
                                             {
                                                 log::error!(
                                                     "[{}] Failed to send handshake response: {}",
@@ -838,7 +870,10 @@ async fn run_vpn_mode(
                         client.last_activity = Instant::now();
                         log::debug!("[{}] {} KeepAlive received", addr, client.name);
                         let response = Packet::keep_alive_ack();
-                        if let Err(e) = socket_rx.send_to(&response.encode(), addr).await {
+                        if let Err(e) = socket_rx
+                            .send_to(&obfuscator_rx.obfuscate(&response), addr)
+                            .await
+                        {
                             log::error!("[{}] Failed to send KeepAliveAck: {}", addr, e);
                         }
                     } else {
@@ -884,7 +919,10 @@ async fn run_vpn_mode(
                         Ok(encrypted) => {
                             metrics_tx.record_sent(encrypted.len() as u64);
                             let packet = Packet::data(encrypted);
-                            if let Err(e) = socket_tx.send_to(&packet.encode(), addr).await {
+                            if let Err(e) = socket_tx
+                                .send_to(&obfuscator_tx.obfuscate(&packet), addr)
+                                .await
+                            {
                                 loggers_tx
                                     .udp_send
                                     .warn(&format!("[{}] UDP send error: {}", addr, e));
@@ -1046,14 +1084,32 @@ async fn main() -> Result<()> {
     let socket = Arc::new(socket);
     let metrics = Arc::new(VpnMetrics::new());
 
+    // Create obfuscator
+    let obfuscator = Arc::new(
+        PacketObfuscator::new(&config.obfuscation).context("Failed to create packet obfuscator")?,
+    );
+    if config.obfuscation.enabled {
+        log::info!(
+            "Packet obfuscation enabled (header_size={}, padding={}-{}, junk={}-{})",
+            config.obfuscation.header_size,
+            config.obfuscation.min_padding,
+            config.obfuscation.max_padding,
+            config.obfuscation.junk_min,
+            config.obfuscation.junk_max
+        );
+    }
+
     if args.echo {
         log::info!("Running in ECHO mode (no TUN)");
-        run_echo_mode(socket, server, metrics).await
+        run_echo_mode(socket, server, metrics, obfuscator).await
     } else {
         log::info!("Running in VPN mode");
         if args.stats {
             log::info!("Stats enabled, writing to: {}", config.stats_file);
         }
-        run_vpn_mode(socket, server, &config, peers_path, metrics, args.stats).await
+        run_vpn_mode(
+            socket, server, &config, peers_path, metrics, args.stats, obfuscator,
+        )
+        .await
     }
 }

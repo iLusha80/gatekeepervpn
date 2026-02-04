@@ -640,6 +640,7 @@ dependencies = [
  "chrono",
  "clap",
  "gatekeeper-common",
+ "rand",
  "serde",
  "toml",
  "x25519-dalek",
