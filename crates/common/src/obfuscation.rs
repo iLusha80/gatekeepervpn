@@ -27,9 +27,9 @@ pub struct PacketObfuscator {
 
 impl PacketObfuscator {
     /// Create a new obfuscator from config.
-    /// If enabled and PSK is empty, generates a random PSK automatically.
-    /// Use `generated_psk()` to retrieve it for sharing with the other side.
-    pub fn new(config: &ObfuscationConfig) -> Result<Self, Error> {
+    /// If enabled and PSK is empty, derives it from `server_public_key` (known to both sides).
+    /// If `server_public_key` is also empty, obfuscation key is derived from a fixed domain separator.
+    pub fn new(config: &ObfuscationConfig, server_public_key: &[u8]) -> Result<Self, Error> {
         if !config.enabled {
             return Ok(Self {
                 enabled: false,
@@ -44,12 +44,9 @@ impl PacketObfuscator {
         }
 
         let (psk_bytes, generated_psk) = if config.psk.is_empty() {
-            // Auto-generate PSK
-            use rand::RngCore;
-            let mut psk = [0u8; 32];
-            rand::rng().fill_bytes(&mut psk);
-            let encoded = crate::config::keys::encode(&psk);
-            (psk.to_vec(), Some(encoded))
+            // Derive PSK from server public key (both sides know it)
+            let derived = derive_psk_from_pubkey(server_public_key);
+            (derived.to_vec(), Some("auto".to_string()))
         } else {
             let bytes = crate::config::keys::decode(&config.psk)
                 .map_err(|_| Error::Obfuscation("invalid PSK: base64 decode failed".to_string()))?;
@@ -212,6 +209,25 @@ impl PacketObfuscator {
     }
 }
 
+/// Derive a 32-byte PSK from server public key using BLAKE2s with domain separator
+fn derive_psk_from_pubkey(server_public_key: &[u8]) -> [u8; 32] {
+    use blake2::Blake2sMac;
+    use blake2::digest::Mac;
+    use blake2::digest::consts::U32;
+
+    type Blake2sMac256 = Blake2sMac<U32>;
+
+    // Use domain separator as key, server public key as message
+    let mut mac = Blake2sMac256::new_from_slice(b"gatekeeper-obfuscation-psk-v1")
+        .expect("BLAKE2s accepts any key size");
+    mac.update(server_public_key);
+    let result = mac.finalize();
+    let bytes = result.into_bytes();
+    let mut psk = [0u8; 32];
+    psk.copy_from_slice(&bytes);
+    psk
+}
+
 /// Derive a 32-byte header key from PSK using BLAKE2s
 fn derive_header_key(psk: &[u8]) -> [u8; 32] {
     use blake2::Blake2sMac;
@@ -238,6 +254,10 @@ mod tests {
         keys::encode(&[0xABu8; 32])
     }
 
+    fn test_server_pubkey() -> Vec<u8> {
+        vec![0x42u8; 32]
+    }
+
     fn enabled_config() -> ObfuscationConfig {
         ObfuscationConfig {
             enabled: true,
@@ -252,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_data_packet() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         let original = Packet::data(b"hello world".to_vec());
 
         let obfuscated = obf.obfuscate(&original);
@@ -264,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_all_packet_types() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         let cookie = [42u8; 32];
         let packets = vec![
             Packet::handshake_init(vec![1, 2, 3]),
@@ -290,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_obfuscated_differs_from_plain() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         let packet = Packet::data(b"test".to_vec());
 
         let plain = packet.encode();
@@ -313,7 +333,7 @@ mod tests {
             junk_min: 0,
             junk_max: 0,
         };
-        let obf = PacketObfuscator::new(&config).unwrap();
+        let obf = PacketObfuscator::new(&config, &test_server_pubkey()).unwrap();
         let packet = Packet::data(b"x".to_vec());
 
         let plain = packet.encode(); // 1 type + 1 payload = 2
@@ -334,7 +354,7 @@ mod tests {
             junk_min: 0,
             junk_max: 0,
         };
-        let obf = PacketObfuscator::new(&config).unwrap();
+        let obf = PacketObfuscator::new(&config, &test_server_pubkey()).unwrap();
         let packet = Packet::data(b"x".to_vec());
 
         let plain = packet.encode(); // 2 bytes
@@ -350,7 +370,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let obf = PacketObfuscator::new(&config).unwrap();
+        let obf = PacketObfuscator::new(&config, &test_server_pubkey()).unwrap();
         let packet = Packet::data(b"hello".to_vec());
 
         let plain = packet.encode();
@@ -365,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_invalid_data_returns_error() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
 
         // Too short
         let result = obf.deobfuscate(Bytes::from(vec![1, 2]));
@@ -381,14 +401,14 @@ mod tests {
 
     #[test]
     fn test_junk_packet_generation() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         let junk = obf.generate_junk_packet();
         assert!(junk.len() >= 16 && junk.len() <= 128);
     }
 
     #[test]
     fn test_junk_count_range() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         for _ in 0..50 {
             let count = obf.junk_count();
             assert!(count >= 1 && count <= 3);
@@ -401,7 +421,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let obf = PacketObfuscator::new(&config).unwrap();
+        let obf = PacketObfuscator::new(&config, &test_server_pubkey()).unwrap();
         assert_eq!(obf.junk_count(), 0);
     }
 
@@ -412,7 +432,7 @@ mod tests {
             psk: String::new(),
             ..Default::default()
         };
-        let obf = PacketObfuscator::new(&config).unwrap();
+        let obf = PacketObfuscator::new(&config, &test_server_pubkey()).unwrap();
         assert!(obf.is_enabled());
         assert!(obf.generated_psk().is_some());
 
@@ -426,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_explicit_psk_no_generated() {
-        let obf = PacketObfuscator::new(&enabled_config()).unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         assert!(obf.generated_psk().is_none());
     }
 
@@ -437,7 +457,7 @@ mod tests {
             psk: keys::encode(&[0u8; 16]), // 16 bytes instead of 32
             ..Default::default()
         };
-        let result = PacketObfuscator::new(&config);
+        let result = PacketObfuscator::new(&config, &test_server_pubkey());
         assert!(result.is_err());
     }
 }

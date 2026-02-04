@@ -20,6 +20,20 @@ pub fn generate_keypair() -> Result<Keypair, Error> {
     Ok(builder.generate_keypair()?)
 }
 
+/// Derive public key from private key (X25519) using snow's DH
+pub fn public_key_from_private(private_key: &[u8]) -> Result<Vec<u8>, Error> {
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+
+    let resolver = DefaultResolver;
+    let dh = resolver
+        .resolve_dh(&snow::params::DHChoice::Curve25519)
+        .ok_or(Error::InvalidKey)?;
+
+    let mut dh_state = dh;
+    dh_state.set(private_key);
+    Ok(dh_state.pubkey().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
