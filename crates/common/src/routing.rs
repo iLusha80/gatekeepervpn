@@ -72,6 +72,81 @@ pub fn get_default_gateway() -> Result<Ipv4Addr, Error> {
     Err(Error::Route("Default gateway not found".into()))
 }
 
+/// Update the route to VPN server through the current default gateway.
+/// Used during roaming when the network interface changes (WiFi → LTE).
+#[cfg(target_os = "macos")]
+pub fn update_server_route(server_ip: Ipv4Addr) -> Result<(), Error> {
+    let new_gateway = get_default_gateway()?;
+    log::info!(
+        "Updating route to VPN server {} via new gateway {}",
+        server_ip,
+        new_gateway
+    );
+
+    // Delete old route (ignore errors — might not exist)
+    let _ = Command::new("sudo")
+        .args(["route", "-n", "delete", "-host", &server_ip.to_string()])
+        .status();
+
+    // Add new route through current gateway
+    let status = Command::new("sudo")
+        .args([
+            "route",
+            "-n",
+            "add",
+            "-host",
+            &server_ip.to_string(),
+            &new_gateway.to_string(),
+        ])
+        .status()
+        .map_err(Error::Io)?;
+
+    if !status.success() {
+        return Err(Error::Route(format!(
+            "Failed to add route to {} via {}",
+            server_ip, new_gateway
+        )));
+    }
+
+    log::info!("Server route updated: {} via {}", server_ip, new_gateway);
+    Ok(())
+}
+
+/// Update the route to VPN server through the current default gateway.
+/// Used during roaming when the network interface changes.
+#[cfg(target_os = "linux")]
+pub fn update_server_route(server_ip: Ipv4Addr) -> Result<(), Error> {
+    let new_gateway = get_default_gateway()?;
+    log::info!(
+        "Updating route to VPN server {} via new gateway {}",
+        server_ip,
+        new_gateway
+    );
+
+    // Replace route (or add if not exists)
+    let status = Command::new("sudo")
+        .args([
+            "ip",
+            "route",
+            "replace",
+            &format!("{}/32", server_ip),
+            "via",
+            &new_gateway.to_string(),
+        ])
+        .status()
+        .map_err(Error::Io)?;
+
+    if !status.success() {
+        return Err(Error::Route(format!(
+            "Failed to update route to {} via {}",
+            server_ip, new_gateway
+        )));
+    }
+
+    log::info!("Server route updated: {} via {}", server_ip, new_gateway);
+    Ok(())
+}
+
 /// Set up routes for VPN
 #[cfg(target_os = "macos")]
 pub fn setup_routes(config: &RouteConfig) -> Result<(), Error> {

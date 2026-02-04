@@ -16,7 +16,7 @@ use gatekeeper_common::{
     ClientConfig, DnsConfig, DnsState, Error as CommonError, Initiator, Packet, PacketObfuscator,
     PacketType, RouteConfig, Transport, TunConfig, TunDevice, TunReader, TunWriter,
     VpnErrorLoggers, VpnMetrics, cleanup_dns, cleanup_routes, configure_socket, setup_dns,
-    setup_routes,
+    setup_routes, update_server_route,
 };
 
 #[derive(Parser, Debug)]
@@ -245,6 +245,15 @@ impl ConnectionState {
     }
 }
 
+/// Check if an IO error indicates the network interface is gone
+/// (EADDRNOTAVAIL on macOS = error 49, ENETUNREACH on Linux = error 101)
+fn is_network_unreachable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::NetworkUnreachable
+    )
+}
+
 /// Reason why the VPN data loop exited
 enum VpnExitReason {
     /// Graceful shutdown (SIGINT/SIGTERM)
@@ -299,6 +308,10 @@ async fn run_vpn_loop(
                                 metrics.record_sent(encrypted.len() as u64);
                                 let packet = Packet::data(encrypted);
                                 if let Err(e) = socket.send(&obfuscator.obfuscate(&packet)).await {
+                                    if is_network_unreachable(&e) {
+                                        log::warn!("Network interface lost, triggering roam");
+                                        return VpnExitReason::ConnectionTimeout;
+                                    }
                                     error_loggers.udp_send.warn(&format!("UDP send error: {}", e));
                                 }
                             }
@@ -367,6 +380,10 @@ async fn run_vpn_loop(
                 }
                 let packet = Packet::keep_alive();
                 if let Err(e) = socket.send(&obfuscator.obfuscate(&packet)).await {
+                    if is_network_unreachable(&e) {
+                        log::warn!("Network interface lost (keepalive), triggering roam");
+                        return VpnExitReason::ConnectionTimeout;
+                    }
                     log::error!("Failed to send keep-alive: {}", e);
                 } else {
                     log::debug!("KeepAlive sent");
@@ -476,6 +493,15 @@ async fn run_vpn_mode(
             VpnExitReason::Shutdown => break,
             VpnExitReason::ConnectionTimeout => {
                 log::info!("Attempting soft roam (new socket, same session)...");
+
+                // Brief delay to let the new network interface stabilize
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Update route to VPN server through new default gateway
+                if let Err(e) = update_server_route(server_ip) {
+                    log::warn!("Failed to update server route: {}", e);
+                    // Continue anyway — route might still work
+                }
 
                 // Create new UDP socket
                 let new_socket = match UdpSocket::bind("0.0.0.0:0").await {

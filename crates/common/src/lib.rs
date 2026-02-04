@@ -27,6 +27,6 @@ pub use metrics::VpnMetrics;
 pub use nat::{NatConfig, cleanup_nat, enable_ip_forwarding, print_nat_instructions, setup_nat};
 pub use obfuscation::PacketObfuscator;
 pub use protocol::{Packet, PacketType};
-pub use routing::{RouteConfig, cleanup_routes, setup_routes};
+pub use routing::{RouteConfig, cleanup_routes, setup_routes, update_server_route};
 pub use socket::{DEFAULT_BUFFER_SIZE, configure_socket, configure_socket_buffers};
 pub use tun_device::{TunConfig, TunDevice, TunReader, TunWriter};
