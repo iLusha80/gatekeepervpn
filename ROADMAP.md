@@ -26,7 +26,7 @@
 | DNS через VPN | Автонастройка DNS при подключении (macOS/Linux) |
 | Метрики | AtomicU64 счётчики, JSON stats, `gkvpn status` |
 | Traffic Obfuscation | Anti-DPI: header XOR, random padding/header, junk packets (PSK-based) |
-| Roaming | Переключение сети (WiFi→LTE) без re-handshake, soft roam на клиенте |
+| Roaming | Переключение сети (WiFi→LTE) без re-handshake, мгновенное обнаружение потери сети, автообновление маршрутов |
 
 ---
 
@@ -78,7 +78,7 @@ Multi-stage build, Alpine base, volume для конфигов, health check.
 
 ### ~~Roaming~~ ✅
 ~~Обновление client endpoint при валидном пакете с нового адреса. Переключение WiFi/LTE без разрыва.~~
-Реализовано: brute-force `can_decrypt()` на сервере, soft roam loop на клиенте (новый socket + roam ping), fallback на re-handshake.
+Реализовано: brute-force `can_decrypt()` на сервере, soft roam loop на клиенте (новый socket + roam ping), fallback на re-handshake. Мгновенное обнаружение потери сети (EADDRNOTAVAIL), автообновление маршрута к серверу через новый gateway.
 
 | Важность | Сложность |
 |----------|-----------|
