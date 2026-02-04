@@ -14,10 +14,11 @@
 #   SERVER=user@host ./scripts/deploy.sh         # переопределить сервер
 #
 # Переменные окружения:
-#   SERVER        — SSH-адрес сервера (по умолчанию root@<из конфига>)
-#   REMOTE_DIR    — путь к проекту на сервере (по умолчанию /opt/gatekeepervpn)
-#   SSH_KEY       — путь к SSH-ключу (опционально)
-#   BRANCH        — git-ветка для деплоя (по умолчанию main)
+#   SERVER             — SSH-адрес сервера (по умолчанию root@<из конфига>)
+#   REMOTE_DIR         — путь к проекту на сервере (по умолчанию /opt/gatekeepervpn)
+#   SSH_KEY            — путь к SSH-ключу (опционально)
+#   BRANCH             — git-ветка для деплоя (по умолчанию main)
+#   TEST_HOST_PASSWORD — пароль SSH (из .env или env, требует sshpass)
 #
 
 set -euo pipefail
@@ -40,11 +41,20 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Загрузить .env если есть
+ENV_FILE="$PROJECT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    info "Загружен .env"
+fi
+
 # Значения по умолчанию (переопределяются через env)
 SERVER="${SERVER:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/gatekeepervpn}"
 SSH_KEY="${SSH_KEY:-}"
 BRANCH="${BRANCH:-main}"
+TEST_HOST_PASSWORD="${TEST_HOST_PASSWORD:-}"
 NO_RESTART=false
 
 # Бинарники для деплоя
@@ -57,6 +67,55 @@ SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 if [ -n "$SSH_KEY" ]; then
     SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
 fi
+
+# ─── Пароль и sshpass ────────────────────────────────────────────────────────
+
+setup_password_auth() {
+    # Если задан SSH-ключ, пароль не нужен
+    if [ -n "$SSH_KEY" ]; then
+        return
+    fi
+
+    # Если пароль не задан — запросить
+    if [ -z "$TEST_HOST_PASSWORD" ]; then
+        echo ""
+        warn "TEST_HOST_PASSWORD не задан в .env"
+        read -rsp "Введите пароль для $SERVER: " TEST_HOST_PASSWORD
+        echo ""
+        if [ -z "$TEST_HOST_PASSWORD" ]; then
+            warn "Пароль не указан, SSH будет запрашивать пароль интерактивно"
+            return
+        fi
+    fi
+
+    # Проверяем наличие sshpass
+    if ! command -v sshpass &>/dev/null; then
+        warn "sshpass не установлен. Установите: brew install sshpass"
+        warn "SSH будет запрашивать пароль интерактивно"
+        TEST_HOST_PASSWORD=""
+        return
+    fi
+
+    export SSHPASS="$TEST_HOST_PASSWORD"
+    ok "Пароль загружен, используется sshpass"
+}
+
+# Обёртки для ssh/scp с поддержкой пароля
+run_ssh() {
+    if [ -n "$TEST_HOST_PASSWORD" ]; then
+        sshpass -e ssh $SSH_OPTS "$@"
+    else
+        ssh $SSH_OPTS "$@"
+    fi
+}
+
+run_scp() {
+    if [ -n "$TEST_HOST_PASSWORD" ]; then
+        sshpass -e scp $SSH_OPTS "$@"
+    else
+        scp $SSH_OPTS "$@"
+    fi
+}
 
 # ─── Файл конфигурации деплоя ─────────────────────────────────────────────────
 
@@ -130,7 +189,7 @@ check_ssh() {
         echo ""
     fi
 
-    if ! ssh $SSH_OPTS "$SERVER" "echo ok" &>/dev/null; then
+    if ! run_ssh "$SERVER" "echo ok" &>/dev/null; then
         err "Не удалось подключиться к $SERVER"
     fi
     ok "SSH-подключение успешно"
@@ -166,7 +225,7 @@ deploy_build() {
 
     # 3. Сборка на сервере
     info "Запускаю сборку на сервере..."
-    ssh $SSH_OPTS "$SERVER" bash -s << REMOTE_SCRIPT
+    run_ssh "$SERVER" bash -s << REMOTE_SCRIPT
         set -euo pipefail
         cd "$REMOTE_DIR" || { echo "ERROR: Директория $REMOTE_DIR не найдена"; exit 1; }
 
@@ -221,7 +280,7 @@ deploy_binary() {
 
     # Проверяем архитектуру сервера
     local remote_arch
-    remote_arch=$(ssh $SSH_OPTS "$SERVER" "uname -m" 2>/dev/null)
+    remote_arch=$(run_ssh "$SERVER" "uname -m" 2>/dev/null)
     if [ "$remote_arch" = "aarch64" ]; then
         target="aarch64-unknown-linux-gnu"
     fi
@@ -250,7 +309,7 @@ deploy_binary() {
     # 3. Останавливаем сервис и отправляем бинарники
     local build_dir="$PROJECT_DIR/target/$target/release"
     info "Останавливаю сервис перед заменой бинарников..."
-    ssh $SSH_OPTS "$SERVER" "sudo systemctl stop $SERVICE_NAME 2>/dev/null || true; sleep 1"
+    run_ssh "$SERVER" "sudo systemctl stop $SERVICE_NAME 2>/dev/null || true; sleep 1"
 
     info "Отправляю бинарники на $SERVER..."
 
@@ -264,8 +323,8 @@ deploy_binary() {
         local size
         size=$(du -h "$local_path" | cut -f1)
         info "  $bin ($size)..."
-        scp $SSH_OPTS "$local_path" "$SERVER:/tmp/$bin"
-        ssh $SSH_OPTS "$SERVER" "sudo mv /tmp/$bin $REMOTE_BIN_DIR/$bin && sudo chmod +x $REMOTE_BIN_DIR/$bin"
+        run_scp "$local_path" "$SERVER:/tmp/$bin"
+        run_ssh "$SERVER" "sudo mv /tmp/$bin $REMOTE_BIN_DIR/$bin && sudo chmod +x $REMOTE_BIN_DIR/$bin"
         ok "  $bin установлен"
     done
 
@@ -286,7 +345,7 @@ deploy_binary() {
 
 restart_service() {
     info "Перезапускаю сервис $SERVICE_NAME..."
-    ssh $SSH_OPTS "$SERVER" bash -s << RESTART_SCRIPT
+    run_ssh "$SERVER" bash -s << RESTART_SCRIPT
         set -euo pipefail
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
             sudo systemctl restart "$SERVICE_NAME"
@@ -330,10 +389,11 @@ GatekeeperVPN Deploy Script
   При первом запуске создаётся файл .deploy.conf с настройками.
   Также можно задать через переменные окружения:
 
-  SERVER=root@1.2.3.4    SSH-адрес сервера
-  REMOTE_DIR=/opt/gkvpn  Путь к проекту на сервере
-  SSH_KEY=~/.ssh/id_rsa   Путь к SSH-ключу
-  BRANCH=main             Git-ветка для деплоя
+  SERVER=root@1.2.3.4        SSH-адрес сервера
+  REMOTE_DIR=/opt/gkvpn      Путь к проекту на сервере
+  SSH_KEY=~/.ssh/id_rsa       Путь к SSH-ключу
+  BRANCH=main                 Git-ветка для деплоя
+  TEST_HOST_PASSWORD=...      Пароль SSH (через .env или env, требует sshpass)
 
 Примеры:
   ./scripts/deploy.sh                          # build на сервере
@@ -357,6 +417,8 @@ main() {
     if [ -z "$SERVER" ]; then
         create_deploy_config
     fi
+
+    setup_password_auth
 
     case "$MODE" in
         build)  deploy_build ;;
