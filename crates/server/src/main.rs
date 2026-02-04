@@ -23,8 +23,8 @@ use gatekeeper_common::config::keys;
 use gatekeeper_common::{
     CookieState, Error as CommonError, HandshakeRateLimiter, NatConfig, Packet, PacketType,
     PeersConfig, RateLimitDecision, Responder, ServerConfig, Transport, TunConfig, TunDevice,
-    VpnErrorLoggers, cleanup_nat, configure_socket, enable_ip_forwarding, get_destination_ip,
-    print_nat_instructions, setup_nat,
+    VpnErrorLoggers, VpnMetrics, cleanup_nat, configure_socket, enable_ip_forwarding,
+    get_destination_ip, print_nat_instructions, setup_nat,
 };
 
 /// Default peers file location
@@ -55,16 +55,19 @@ struct Args {
     /// Disable peer authorization (allow any client)
     #[arg(long)]
     no_auth: bool,
+
+    /// Enable metrics collection and stats file output
+    #[arg(long)]
+    stats: bool,
 }
 
 /// Connected client session
-#[allow(dead_code)]
 struct ConnectedClient {
     /// Transport state for encryption/decryption
     transport: Transport,
-    /// Client's public key (for future use: key rotation, audit logs)
+    /// Client's public key
     public_key: [u8; 32],
-    /// Assigned VPN IP address (stored for reference, routing uses ip_to_addr map)
+    /// Assigned VPN IP address
     assigned_ip: Ipv4Addr,
     /// Client name from peers.toml
     name: String,
@@ -263,8 +266,7 @@ impl Server {
         self.clients_by_addr.insert(addr, client);
     }
 
-    /// Remove a disconnected client (for future use: timeout handling)
-    #[allow(dead_code)]
+    /// Remove a disconnected client
     fn remove_client(&mut self, addr: &SocketAddr) {
         if let Some(client) = self.clients_by_addr.remove(addr) {
             self.ip_to_addr.remove(&client.assigned_ip);
@@ -275,6 +277,23 @@ impl Server {
                 client.assigned_ip
             );
         }
+    }
+
+    /// Remove clients inactive for longer than the given timeout
+    fn cleanup_inactive_clients(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let inactive: Vec<SocketAddr> = self
+            .clients_by_addr
+            .iter()
+            .filter(|(_, client)| now.duration_since(client.last_activity) > timeout)
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        let count = inactive.len();
+        for addr in inactive {
+            self.remove_client(&addr);
+        }
+        count
     }
 
     /// Get socket address for a VPN IP (unicast routing)
@@ -335,7 +354,11 @@ fn get_file_modified_time(path: &Path) -> Option<SystemTime> {
 }
 
 /// Echo mode: just echo back decrypted data
-async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Result<()> {
+async fn run_echo_mode(
+    socket: Arc<UdpSocket>,
+    server: Arc<Mutex<Server>>,
+    metrics: Arc<VpnMetrics>,
+) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     let error_loggers = VpnErrorLoggers::new();
 
@@ -387,10 +410,13 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                         key_array = p.public_key;
                                     }
                                     server.register_client(addr, transport, key_array, peer);
+                                    metrics.record_handshake_ok();
+                                    metrics.set_active_clients(server.clients_by_addr.len() as u64);
                                     Some(response)
                                 }
                                 Err(e) => {
                                     log::error!("[{}] Handshake error: {}", addr, e);
+                                    metrics.record_handshake_fail();
                                     None
                                 }
                             }
@@ -419,10 +445,15 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                             }
                                             server
                                                 .register_client(addr, transport, key_array, peer);
+                                            metrics.record_handshake_ok();
+                                            metrics.set_active_clients(
+                                                server.clients_by_addr.len() as u64,
+                                            );
                                             Some(response)
                                         }
                                         Err(e) => {
                                             log::error!("[{}] Handshake error: {}", addr, e);
+                                            metrics.record_handshake_fail();
                                             None
                                         }
                                     }
@@ -447,6 +478,7 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                     match server.clients_by_addr.get_mut(&addr) {
                         Some(client) => {
                             client.last_activity = Instant::now();
+                            metrics.record_received(packet.payload.len() as u64);
                             match client.transport.decrypt(&packet.payload) {
                                 Ok(plaintext) => {
                                     log::info!(
@@ -460,7 +492,10 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                     let response_data =
                                         format!("Echo: {}", String::from_utf8_lossy(&plaintext));
                                     match client.transport.encrypt(response_data.as_bytes()) {
-                                        Ok(encrypted) => Some(Packet::data(encrypted)),
+                                        Ok(encrypted) => {
+                                            metrics.record_sent(encrypted.len() as u64);
+                                            Some(Packet::data(encrypted))
+                                        }
                                         Err(e) => {
                                             log::error!("[{}] Encrypt error: {}", addr, e);
                                             None
@@ -473,6 +508,7 @@ async fn run_echo_mode(socket: Arc<UdpSocket>, server: Arc<Mutex<Server>>) -> Re
                                             "[{}] Replayed/out-of-order packet dropped",
                                             addr
                                         ));
+                                        metrics.record_replay();
                                     } else {
                                         error_loggers
                                             .decrypt_crypto
@@ -521,6 +557,8 @@ async fn run_vpn_mode(
     server: Arc<Mutex<Server>>,
     config: &ServerConfig,
     peers_path: PathBuf,
+    metrics: Arc<VpnMetrics>,
+    enable_stats: bool,
 ) -> Result<()> {
     // Parse TUN config
     let tun_address: Ipv4Addr = config.tun_address.parse().context("Invalid TUN address")?;
@@ -592,10 +630,18 @@ async fn run_vpn_mode(
     let socket_rx = socket;
     let server_tx = server.clone();
     let server_rx = server.clone();
+    let server_cleanup_task = server.clone();
     let server_cleanup = server.clone();
     let server_reload = server;
     let loggers_rx = error_loggers.clone();
     let loggers_tx = error_loggers;
+    let metrics_rx = metrics.clone();
+    let metrics_tx = metrics.clone();
+    let metrics_cleanup = metrics.clone();
+    let metrics_stats = metrics.clone();
+
+    let client_timeout = config.client_timeout;
+    let stats_file = config.stats_file.clone();
 
     // Task 0: Hot-reload peers.toml
     let peers_watcher = tokio::spawn(async move {
@@ -677,6 +723,9 @@ async fn run_vpn_mode(
                                         key_array = p.public_key;
                                     }
                                     server.register_client(addr, transport, key_array, peer);
+                                    metrics_rx.record_handshake_ok();
+                                    metrics_rx
+                                        .set_active_clients(server.clients_by_addr.len() as u64);
                                     if let Err(e) =
                                         socket_rx.send_to(&response.encode(), addr).await
                                     {
@@ -689,6 +738,7 @@ async fn run_vpn_mode(
                                 }
                                 Err(e) => {
                                     log::error!("[{}] Handshake error: {}", addr, e);
+                                    metrics_rx.record_handshake_fail();
                                 }
                             }
                         }
@@ -714,6 +764,10 @@ async fn run_vpn_mode(
                                             }
                                             server
                                                 .register_client(addr, transport, key_array, peer);
+                                            metrics_rx.record_handshake_ok();
+                                            metrics_rx.set_active_clients(
+                                                server.clients_by_addr.len() as u64,
+                                            );
                                             if let Err(e) =
                                                 socket_rx.send_to(&response.encode(), addr).await
                                             {
@@ -726,6 +780,7 @@ async fn run_vpn_mode(
                                         }
                                         Err(e) => {
                                             log::error!("[{}] Handshake error: {}", addr, e);
+                                            metrics_rx.record_handshake_fail();
                                         }
                                     }
                                 }
@@ -745,6 +800,7 @@ async fn run_vpn_mode(
                 PacketType::Data => {
                     if let Some(client) = server.clients_by_addr.get_mut(&addr) {
                         client.last_activity = Instant::now();
+                        metrics_rx.record_received(packet.payload.len() as u64);
                         match client.transport.decrypt(&packet.payload) {
                             Ok(plaintext) => {
                                 log::debug!(
@@ -765,6 +821,7 @@ async fn run_vpn_mode(
                                         "[{}] Replayed/out-of-order packet dropped",
                                         addr
                                     ));
+                                    metrics_rx.record_replay();
                                 } else {
                                     loggers_rx
                                         .decrypt_crypto
@@ -825,6 +882,7 @@ async fn run_vpn_mode(
                 if let Some(client) = server.clients_by_addr.get_mut(&addr) {
                     match client.transport.encrypt(&buf[..n]) {
                         Ok(encrypted) => {
+                            metrics_tx.record_sent(encrypted.len() as u64);
                             let packet = Packet::data(encrypted);
                             if let Err(e) = socket_tx.send_to(&packet.encode(), addr).await {
                                 loggers_tx
@@ -846,6 +904,50 @@ async fn run_vpn_mode(
         }
     });
 
+    // Task 3: Cleanup inactive clients
+    let cleanup_task = tokio::spawn(async move {
+        if client_timeout == 0 {
+            // Timeout disabled, wait forever
+            std::future::pending::<()>().await;
+            return;
+        }
+
+        let timeout_duration = Duration::from_secs(client_timeout);
+        let mut cleanup_interval = interval(Duration::from_secs(30));
+
+        loop {
+            cleanup_interval.tick().await;
+            let mut server = server_cleanup_task.lock().await;
+            let removed = server.cleanup_inactive_clients(timeout_duration);
+            if removed > 0 {
+                log::info!(
+                    "Cleaned up {} inactive client(s) (timeout: {}s)",
+                    removed,
+                    client_timeout
+                );
+                metrics_cleanup.set_active_clients(server.clients_by_addr.len() as u64);
+            }
+        }
+    });
+
+    // Task 4: Stats writer (if enabled)
+    let stats_writer = tokio::spawn(async move {
+        if !enable_stats {
+            std::future::pending::<()>().await;
+            return;
+        }
+
+        let mut stats_interval = interval(Duration::from_secs(10));
+        loop {
+            stats_interval.tick().await;
+            let json = metrics_stats.to_json();
+            if let Err(e) = std::fs::write(&stats_file, &json) {
+                log::warn!("Failed to write stats file: {}", e);
+            }
+            log::debug!("Stats: {}", metrics_stats.format_summary());
+        }
+    });
+
     // Build NAT config for cleanup
     let nat_config = if config.enable_nat {
         Some(NatConfig {
@@ -861,6 +963,8 @@ async fn run_vpn_mode(
         _ = udp_to_tun => log::error!("UDP->TUN task finished unexpectedly"),
         _ = tun_to_udp => log::error!("TUN->UDP task finished unexpectedly"),
         _ = peers_watcher => log::error!("Peers watcher task finished unexpectedly"),
+        _ = cleanup_task => log::error!("Cleanup task finished unexpectedly"),
+        _ = stats_writer => log::error!("Stats writer task finished unexpectedly"),
         _ = shutdown_signal() => {
             log::info!("Server shutting down...");
         }
@@ -940,12 +1044,16 @@ async fn main() -> Result<()> {
     log::info!("GatekeeperVPN server listening on {}", config.listen);
 
     let socket = Arc::new(socket);
+    let metrics = Arc::new(VpnMetrics::new());
 
     if args.echo {
         log::info!("Running in ECHO mode (no TUN)");
-        run_echo_mode(socket, server).await
+        run_echo_mode(socket, server, metrics).await
     } else {
         log::info!("Running in VPN mode");
-        run_vpn_mode(socket, server, &config, peers_path).await
+        if args.stats {
+            log::info!("Stats enabled, writing to: {}", config.stats_file);
+        }
+        run_vpn_mode(socket, server, &config, peers_path, metrics, args.stats).await
     }
 }

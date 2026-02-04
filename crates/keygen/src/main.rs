@@ -134,6 +134,13 @@ enum Commands {
         /// Client name
         name: String,
     },
+
+    /// Show VPN server status (reads stats file)
+    Status {
+        /// Path to stats file
+        #[arg(long, default_value = "/tmp/gatekeeper-vpn.stats")]
+        stats_file: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -173,6 +180,8 @@ fn main() -> Result<()> {
         Commands::List => list_clients(&cli.config_dir),
 
         Commands::Show { name } => show_client(&cli.config_dir, name),
+
+        Commands::Status { stats_file } => show_status(&stats_file),
     }
 }
 
@@ -517,6 +526,86 @@ fn show_client(config_dir: &Path, name: String) -> Result<()> {
     println!("{}", content);
 
     Ok(())
+}
+
+fn show_status(stats_file: &Path) -> Result<()> {
+    if !stats_file.exists() {
+        bail!(
+            "Stats file not found: {}\nIs the server running with --stats flag?",
+            stats_file.display()
+        );
+    }
+
+    let content = fs::read_to_string(stats_file)
+        .with_context(|| format!("Failed to read stats file: {}", stats_file.display()))?;
+
+    // Parse simple JSON manually (no serde_json dependency)
+    // Format: {"key":value,...}
+    let content = content.trim();
+    if !content.starts_with('{') || !content.ends_with('}') {
+        bail!("Invalid stats file format");
+    }
+
+    let inner = &content[1..content.len() - 1];
+    let mut values: Vec<(&str, &str)> = Vec::new();
+
+    for pair in inner.split(',') {
+        if let Some((key, value)) = pair.split_once(':') {
+            let key = key.trim().trim_matches('"');
+            let value = value.trim();
+            values.push((key, value));
+        }
+    }
+
+    println!("GatekeeperVPN Server Status");
+    println!("{}", "=".repeat(40));
+
+    for (key, value) in &values {
+        let label = match *key {
+            "uptime_secs" => {
+                let secs: u64 = value.parse().unwrap_or(0);
+                let hours = secs / 3600;
+                let minutes = (secs % 3600) / 60;
+                let seconds = secs % 60;
+                println!(
+                    "{:<25} {:02}:{:02}:{:02}",
+                    "Uptime:", hours, minutes, seconds
+                );
+                continue;
+            }
+            "active_clients" => "Active clients:",
+            "packets_sent" => "Packets sent:",
+            "packets_received" => "Packets received:",
+            "bytes_sent" => "Bytes sent:",
+            "bytes_received" => "Bytes received:",
+            "handshakes_completed" => "Handshakes OK:",
+            "handshakes_failed" => "Handshakes failed:",
+            "replay_packets_dropped" => "Replay dropped:",
+            _ => key,
+        };
+
+        // Format bytes fields
+        if *key == "bytes_sent" || *key == "bytes_received" {
+            let bytes: u64 = value.parse().unwrap_or(0);
+            println!("{:<25} {}", label, format_bytes_display(bytes));
+        } else {
+            println!("{:<25} {}", label, value);
+        }
+    }
+
+    Ok(())
+}
+
+fn format_bytes_display(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 // ============================================================================

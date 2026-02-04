@@ -14,8 +14,9 @@ use tokio::time::{interval, timeout};
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{
-    ClientConfig, Error as CommonError, Initiator, Packet, PacketType, RouteConfig, Transport,
-    TunConfig, TunDevice, VpnErrorLoggers, cleanup_routes, configure_socket, setup_routes,
+    ClientConfig, DnsConfig, DnsState, Error as CommonError, Initiator, Packet, PacketType,
+    RouteConfig, Transport, TunConfig, TunDevice, VpnErrorLoggers, VpnMetrics, cleanup_dns,
+    cleanup_routes, configure_socket, setup_dns, setup_routes,
 };
 
 #[derive(Parser, Debug)]
@@ -273,12 +274,32 @@ async fn run_vpn_mode(
         }
     }
 
+    // Setup DNS if configured
+    let dns_state: Option<DnsState> = if !config.dns_servers.is_empty() {
+        let dns_config = DnsConfig::new(config.dns_servers.clone());
+        match setup_dns(&dns_config) {
+            Ok(state) => {
+                log::info!("DNS configured: {:?}", config.dns_servers);
+                Some(state)
+            }
+            Err(e) => {
+                log::error!("Failed to setup DNS: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Split TUN device for concurrent read/write
     let (mut tun_reader, mut tun_writer) = tun_device.split();
 
     // Shared connection state
     let conn_state = Arc::new(ConnectionState::new());
     conn_state.update_last_received(); // Initial timestamp
+
+    // Metrics
+    let metrics = Arc::new(VpnMetrics::new());
 
     // Rate-limited error loggers
     let error_loggers = Arc::new(VpnErrorLoggers::new());
@@ -293,6 +314,8 @@ async fn run_vpn_mode(
     let conn_state_ka = conn_state;
     let loggers_tx = error_loggers.clone();
     let loggers_rx = error_loggers;
+    let metrics_tx = metrics.clone();
+    let metrics_rx = metrics;
 
     let keepalive_interval = config.keepalive_interval;
     let keepalive_timeout = config.keepalive_timeout;
@@ -325,6 +348,7 @@ async fn run_vpn_mode(
                 }
             };
 
+            metrics_tx.record_sent(encrypted.len() as u64);
             let packet = Packet::data(encrypted);
             if let Err(e) = socket_tx.send(&packet.encode()).await {
                 // Rate-limited warning for buffer overflow (common during bursts)
@@ -361,6 +385,7 @@ async fn run_vpn_mode(
 
             match packet.packet_type {
                 PacketType::Data => {
+                    metrics_rx.record_received(packet.payload.len() as u64);
                     // Decrypt
                     let plaintext = {
                         let transport = transport_rx.lock().await;
@@ -446,8 +471,17 @@ async fn run_vpn_mode(
         _ = shutdown_signal() => {}
     }
 
-    // Cleanup routes
+    // Cleanup DNS
     log::info!("Cleaning up...");
+    if let Some(ref state) = dns_state {
+        if let Err(e) = cleanup_dns(state) {
+            log::error!("Failed to cleanup DNS: {}", e);
+        } else {
+            log::info!("DNS restored successfully");
+        }
+    }
+
+    // Cleanup routes
     if config.route_all_traffic || !config.routed_subnets.is_empty() {
         if let Err(e) = cleanup_routes(&route_config) {
             log::error!("Failed to cleanup routes: {}", e);

@@ -21,3 +21,9 @@ external_interface = "eth0"
 # - Enable IP forwarding
 # - Setup NAT/masquerading rules
 enable_nat = true
+
+# Inactive client timeout in seconds (0 to disable, default 300)
+# client_timeout = 300
+
+# Stats file path (used with --stats flag)
+# stats_file = "/tmp/gatekeeper-vpn.stats"

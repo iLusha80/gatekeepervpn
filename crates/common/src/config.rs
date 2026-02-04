@@ -147,6 +147,12 @@ pub struct ServerConfig {
     /// Enable automatic NAT configuration
     #[serde(default = "default_enable_nat")]
     pub enable_nat: bool,
+    /// Inactive client timeout in seconds (0 to disable)
+    #[serde(default = "default_client_timeout")]
+    pub client_timeout: u64,
+    /// Path to stats file for metrics JSON output
+    #[serde(default = "default_stats_file")]
+    pub stats_file: String,
 }
 
 fn default_server_tun_address() -> String {
@@ -180,6 +186,14 @@ fn default_enable_nat() -> bool {
     true
 }
 
+fn default_client_timeout() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_stats_file() -> String {
+    "/tmp/gatekeeper-vpn.stats".to_string()
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -190,6 +204,8 @@ impl Default for ServerConfig {
             tun_mtu: default_tun_mtu_server(),
             external_interface: default_external_interface(),
             enable_nat: default_enable_nat(),
+            client_timeout: default_client_timeout(),
+            stats_file: default_stats_file(),
         }
     }
 }
@@ -233,6 +249,9 @@ pub struct ClientConfig {
     /// Maximum number of reconnection attempts (0 = unlimited)
     #[serde(default = "default_max_reconnect_attempts")]
     pub max_reconnect_attempts: u32,
+    /// DNS servers to use when VPN is connected
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
 }
 
 fn default_tun_address() -> String {
@@ -283,6 +302,7 @@ impl Default for ClientConfig {
             reconnect_enabled: default_reconnect_enabled(),
             reconnect_delay: default_reconnect_delay(),
             max_reconnect_attempts: default_max_reconnect_attempts(),
+            dns_servers: vec![],
         }
     }
 }
@@ -326,5 +346,60 @@ mod tests {
     fn test_client_config_default() {
         let config = ClientConfig::default();
         assert_eq!(config.server, "127.0.0.1:51820");
+        assert!(config.dns_servers.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_default_client_timeout() {
+        let config = ServerConfig::default();
+        assert_eq!(config.client_timeout, 300);
+        assert_eq!(config.stats_file, "/tmp/gatekeeper-vpn.stats");
+    }
+
+    #[test]
+    fn test_server_config_deserialize_with_timeout() {
+        let toml_str = r#"
+            listen = "0.0.0.0:51820"
+            private_key = "test"
+            client_timeout = 600
+            stats_file = "/var/run/vpn.stats"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.client_timeout, 600);
+        assert_eq!(config.stats_file, "/var/run/vpn.stats");
+    }
+
+    #[test]
+    fn test_server_config_deserialize_without_timeout() {
+        let toml_str = r#"
+            listen = "0.0.0.0:51820"
+            private_key = "test"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.client_timeout, 300);
+        assert_eq!(config.stats_file, "/tmp/gatekeeper-vpn.stats");
+    }
+
+    #[test]
+    fn test_client_config_with_dns_servers() {
+        let toml_str = r#"
+            server = "1.2.3.4:51820"
+            private_key = "test"
+            server_public_key = "test"
+            dns_servers = ["1.1.1.1", "8.8.8.8"]
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn test_client_config_without_dns_servers() {
+        let toml_str = r#"
+            server = "1.2.3.4:51820"
+            private_key = "test"
+            server_public_key = "test"
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.dns_servers.is_empty());
     }
 }

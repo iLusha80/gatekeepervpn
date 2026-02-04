@@ -1,11 +1,13 @@
 pub mod config;
 pub mod cookie;
 pub mod crypto;
+pub mod dns;
 pub mod error;
 pub mod handshake;
 pub mod ip_parser;
 pub mod ip_pool;
 pub mod logging;
+pub mod metrics;
 pub mod nat;
 pub mod protocol;
 pub mod routing;
@@ -14,11 +16,13 @@ pub mod tun_device;
 
 pub use config::{ClientConfig, PeerConfig, PeersConfig, ServerConfig};
 pub use cookie::{CookieState, HandshakeRateLimiter, RateLimitDecision};
+pub use dns::{DnsConfig, DnsState, cleanup_dns, setup_dns};
 pub use error::Error;
 pub use handshake::{Initiator, Responder, Transport};
 pub use ip_parser::{get_destination_ip, get_source_ip, get_src_dst_ips, is_ipv4};
 pub use ip_pool::IpPool;
 pub use logging::{RateLimitedLogger, VpnErrorLoggers};
+pub use metrics::VpnMetrics;
 pub use nat::{NatConfig, cleanup_nat, enable_ip_forwarding, print_nat_instructions, setup_nat};
 pub use protocol::{Packet, PacketType};
 pub use routing::{RouteConfig, cleanup_routes, setup_routes};

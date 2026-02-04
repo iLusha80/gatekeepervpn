@@ -10,3 +10,6 @@ private_key = ""
 # Server's public key (base64 encoded)
 # Get this from the server output when it starts
 server_public_key = ""
+
+# DNS servers to use when VPN is connected (empty = don't change DNS)
+# dns_servers = ["1.1.1.1", "8.8.8.8"]

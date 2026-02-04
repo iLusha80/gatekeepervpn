@@ -28,4 +28,7 @@ pub enum Error {
 
     #[error("routing error: {0}")]
     Route(String),
+
+    #[error("DNS error: {0}")]
+    Dns(String),
 }
