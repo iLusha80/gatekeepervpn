@@ -83,7 +83,7 @@ sudo bash scripts/setup.sh
 - NAT и IP forwarding
 - Systemd-сервис
 
-Подробнее: [QUICKSTART.md](QUICKSTART.md), [INSTALL.md](INSTALL.md)
+Подробнее: [ROADMAP.md](ROADMAP.md)
 
 ### Ручная настройка
 
@@ -300,16 +300,13 @@ max_reconnect_attempts = 0         # 0 = безлимитно
 
 ## DNS
 
-Клиент не меняет DNS автоматически. Настройте вручную:
+Клиент автоматически переключает системные DNS при подключении и восстанавливает при отключении. Настройка в `client.conf`:
 
-```bash
-# macOS
-sudo networksetup -setdnsservers "Wi-Fi" 8.8.8.8 1.1.1.1
-
-# Linux (добавить в /etc/resolv.conf)
-nameserver 8.8.8.8
-nameserver 1.1.1.1
+```toml
+dns_servers = ["1.1.1.1", "8.8.8.8"]
 ```
+
+Если `dns_servers` не указан — DNS не меняется.
 
 ## Проверка работы VPN
 

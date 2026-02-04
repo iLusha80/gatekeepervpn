@@ -1,8 +1,10 @@
 /target
 
-# Ignore all .md files except README.md
+# Ignore all .md files except project docs
 *.md
 !README.md
+!CLAUDE.md
+!ROADMAP.md
 
 # Deploy config (contains server SSH address)
 .deploy.conf
