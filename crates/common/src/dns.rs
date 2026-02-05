@@ -249,4 +249,29 @@ mod tests {
         let config = DnsConfig::new(vec![]);
         assert!(config.is_empty());
     }
+
+    #[test]
+    fn test_dns_config_single_server() {
+        let config = DnsConfig::new(vec!["1.1.1.1".to_string()]);
+        assert_eq!(config.servers.len(), 1);
+        assert!(!config.is_empty());
+    }
+
+    #[test]
+    fn test_dns_config_multiple_servers() {
+        let config = DnsConfig::new(vec![
+            "1.1.1.1".to_string(),
+            "8.8.8.8".to_string(),
+            "9.9.9.9".to_string(),
+        ]);
+        assert_eq!(config.servers.len(), 3);
+        assert_eq!(config.servers[2], "9.9.9.9");
+    }
+
+    #[test]
+    fn test_setup_dns_empty_config_fails() {
+        let config = DnsConfig::new(vec![]);
+        let result = setup_dns(&config);
+        assert!(result.is_err());
+    }
 }

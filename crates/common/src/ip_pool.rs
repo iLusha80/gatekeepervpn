@@ -326,4 +326,55 @@ mod tests {
         let ip2 = pool.allocate().unwrap();
         assert_eq!(ip, ip2);
     }
+
+    #[test]
+    fn test_pool_exhaustion_returns_none() {
+        // /30 = 4 addresses: .0 network, .1 server, .2 client, .3 broadcast
+        let mut pool = IpPool::new("192.168.1.0", 30).unwrap();
+        assert_eq!(pool.max_clients(), 1);
+        let _ip = pool.allocate().unwrap();
+        assert!(pool.allocate().is_none());
+    }
+
+    #[test]
+    fn test_allocate_released_ip() {
+        let mut pool = IpPool::new("10.10.10.0", 24).unwrap();
+        let ip1 = pool.allocate().unwrap();
+        let ip2 = pool.allocate().unwrap();
+        assert_eq!(pool.allocated_count(), 2);
+
+        pool.release(ip1);
+        assert_eq!(pool.allocated_count(), 1);
+        assert!(!pool.is_allocated(ip1));
+
+        // After releasing ip1 and allocating more, ip1 should eventually be reused
+        // (pool wraps around)
+        let mut found = false;
+        for _ in 0..254 {
+            if let Some(ip) = pool.allocate() {
+                if ip == ip1 {
+                    found = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        assert!(found, "Released IP should be re-allocated");
+        let _ = ip2;
+    }
+
+    #[test]
+    fn test_allocated_ips_iterator() {
+        let mut pool = IpPool::new("10.10.10.0", 24).unwrap();
+        pool.allocate().unwrap(); // .2
+        pool.allocate().unwrap(); // .3
+        pool.allocate().unwrap(); // .4
+
+        let ips: Vec<_> = pool.allocated_ips().cloned().collect();
+        assert_eq!(ips.len(), 3);
+        assert!(ips.contains(&Ipv4Addr::new(10, 10, 10, 2)));
+        assert!(ips.contains(&Ipv4Addr::new(10, 10, 10, 3)));
+        assert!(ips.contains(&Ipv4Addr::new(10, 10, 10, 4)));
+    }
 }

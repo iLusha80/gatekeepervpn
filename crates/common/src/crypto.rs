@@ -44,4 +44,26 @@ mod tests {
         assert_eq!(keypair.public.len(), 32);
         assert_eq!(keypair.private.len(), 32);
     }
+
+    #[test]
+    fn test_public_key_from_private_length() {
+        let keypair = generate_keypair().unwrap();
+        let pubkey = public_key_from_private(&keypair.private).unwrap();
+        assert_eq!(pubkey.len(), 32);
+    }
+
+    #[test]
+    fn test_public_key_from_private_deterministic() {
+        let keypair = generate_keypair().unwrap();
+        let pub1 = public_key_from_private(&keypair.private).unwrap();
+        let pub2 = public_key_from_private(&keypair.private).unwrap();
+        assert_eq!(pub1, pub2);
+    }
+
+    #[test]
+    fn test_public_key_matches_keypair() {
+        let keypair = generate_keypair().unwrap();
+        let derived = public_key_from_private(&keypair.private).unwrap();
+        assert_eq!(derived, keypair.public);
+    }
 }

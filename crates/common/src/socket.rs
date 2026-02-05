@@ -70,3 +70,39 @@ pub fn create_udp_socket(addr: &str) -> io::Result<std::net::UdpSocket> {
 
     Ok(socket.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_udp_socket_localhost() {
+        let sock = create_udp_socket("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0); // OS assigned a port
+    }
+
+    #[test]
+    fn test_create_udp_socket_invalid_addr() {
+        let result = create_udp_socket("not-a-valid-address");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_configure_socket_buffers_no_panic() {
+        // Use tokio runtime since UdpSocket::from_std requires it
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let std_sock = create_udp_socket("127.0.0.1:0").unwrap();
+            let tokio_sock = UdpSocket::from_std(std_sock).unwrap();
+            let result = configure_socket_buffers(&tokio_sock, 1024 * 1024);
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_default_buffer_size_constant() {
+        assert_eq!(DEFAULT_BUFFER_SIZE, 2 * 1024 * 1024);
+    }
+}

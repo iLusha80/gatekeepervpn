@@ -487,4 +487,21 @@ mod tests {
         assert_eq!(config.tun_name, "utun5");
         assert!(config.route_all_traffic);
     }
+
+    #[test]
+    fn test_route_config_split_tunnel() {
+        let config = RouteConfig {
+            tun_name: "utun3".to_string(),
+            tun_gateway: "10.10.10.2".parse().unwrap(),
+            server_ip: "5.6.7.8".parse().unwrap(),
+            vpn_gateway_ip: "10.10.10.1".parse().unwrap(),
+            route_all_traffic: false,
+            routed_subnets: vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()],
+        };
+
+        assert!(!config.route_all_traffic);
+        assert_eq!(config.routed_subnets.len(), 2);
+        assert_eq!(config.server_ip, Ipv4Addr::new(5, 6, 7, 8));
+        assert_eq!(config.vpn_gateway_ip, Ipv4Addr::new(10, 10, 10, 1));
+    }
 }

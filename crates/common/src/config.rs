@@ -559,4 +559,61 @@ mod tests {
         assert_eq!(config.obfuscation.min_padding, 8);
         assert_eq!(config.obfuscation.max_padding, 128);
     }
+
+    // ===== PeersConfig edge-case tests =====
+
+    #[test]
+    fn test_peers_config_new_default() {
+        let pc = PeersConfig::new_default();
+        assert_eq!(pc.subnet, "10.10.10.0");
+        assert_eq!(pc.subnet_mask, 24);
+        assert_eq!(pc.next_ip, Ipv4Addr::new(10, 10, 10, 2));
+        assert!(pc.peers.is_empty());
+        assert_eq!(pc.server_address(), Ipv4Addr::new(10, 10, 10, 1));
+    }
+
+    #[test]
+    fn test_peers_config_new_custom() {
+        let pc = PeersConfig::new("192.168.0.0".to_string(), 16);
+        assert_eq!(pc.subnet, "192.168.0.0");
+        assert_eq!(pc.subnet_mask, 16);
+        assert_eq!(pc.next_ip, Ipv4Addr::new(192, 168, 0, 2));
+    }
+
+    #[test]
+    fn test_peers_config_find_by_name() {
+        let mut pc = PeersConfig::new_default();
+        pc.add_peer(PeerConfig::new(
+            "laptop".to_string(),
+            "key1".to_string(),
+            Ipv4Addr::new(10, 10, 10, 2),
+        ));
+        assert!(pc.find_by_name("laptop").is_some());
+        assert!(pc.find_by_name("desktop").is_none());
+    }
+
+    #[test]
+    fn test_peers_config_find_by_ip() {
+        let mut pc = PeersConfig::new_default();
+        let ip = Ipv4Addr::new(10, 10, 10, 5);
+        pc.add_peer(PeerConfig::new("phone".to_string(), "key2".to_string(), ip));
+        assert!(pc.find_by_ip(ip).is_some());
+        assert!(pc.find_by_ip(Ipv4Addr::new(10, 10, 10, 99)).is_none());
+    }
+
+    #[test]
+    fn test_peers_config_remove_peer() {
+        let mut pc = PeersConfig::new_default();
+        pc.add_peer(PeerConfig::new(
+            "tablet".to_string(),
+            "key3".to_string(),
+            Ipv4Addr::new(10, 10, 10, 3),
+        ));
+        assert_eq!(pc.peers.len(), 1);
+        let removed = pc.remove_peer("tablet");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().name, "tablet");
+        assert!(pc.peers.is_empty());
+        assert!(pc.remove_peer("tablet").is_none());
+    }
 }

@@ -103,3 +103,85 @@ impl Default for VpnErrorLoggers {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note: RateLimitedLogger tracks time from start_time. The first call
+    // at elapsed ~0ms checks if 0ms >= interval_ms. So for intervals > 0,
+    // the first call is suppressed until the interval passes from creation.
+    // We use short intervals to test real behavior.
+
+    #[test]
+    fn test_first_call_logs_with_small_interval() {
+        // With 1ms interval, first call after creation will pass quickly
+        let logger = RateLimitedLogger::new(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(logger.should_log().is_some());
+    }
+
+    #[test]
+    fn test_suppressed_within_interval() {
+        let logger = RateLimitedLogger::new(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        // First call after interval logs
+        assert!(logger.should_log().is_some());
+        // Immediate second call should be suppressed
+        assert!(logger.should_log().is_none());
+    }
+
+    #[test]
+    fn test_logs_after_interval() {
+        let logger = RateLimitedLogger::new(Duration::from_millis(10));
+        // Wait for initial interval
+        std::thread::sleep(Duration::from_millis(15));
+        let first = logger.should_log();
+        assert!(first.is_some());
+        assert_eq!(first.unwrap(), 0); // no suppressed yet
+        // Wait for next interval
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(logger.should_log().is_some());
+    }
+
+    #[test]
+    fn test_suppressed_count_correct() {
+        let logger = RateLimitedLogger::new(Duration::from_millis(50));
+        // Wait for initial interval
+        std::thread::sleep(Duration::from_millis(55));
+        // First call logs
+        assert!(logger.should_log().is_some());
+        // Suppress 3 calls
+        assert!(logger.should_log().is_none());
+        assert!(logger.should_log().is_none());
+        assert!(logger.should_log().is_none());
+        // Wait for interval
+        std::thread::sleep(Duration::from_millis(55));
+        // Next should_log returns suppressed count = 3
+        let result = logger.should_log();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn test_zero_interval_always_logs() {
+        let logger = RateLimitedLogger::new(Duration::from_millis(0));
+        // Every call should succeed with zero interval
+        for _ in 0..10 {
+            assert!(logger.should_log().is_some());
+        }
+    }
+
+    #[test]
+    fn test_vpn_error_loggers_fields_exist() {
+        let loggers = VpnErrorLoggers::new();
+        // Verify all loggers are constructed (fields exist and are usable)
+        // Wait enough for 5s interval to pass? No — just verify they don't panic
+        let _ = loggers.udp_send.should_log();
+        let _ = loggers.decrypt_replay.should_log();
+        let _ = loggers.decrypt_crypto.should_log();
+        let _ = loggers.tun_write.should_log();
+        // Default trait
+        let _default = VpnErrorLoggers::default();
+    }
+}

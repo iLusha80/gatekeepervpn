@@ -289,4 +289,13 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
     }
+
+    #[test]
+    fn test_record_roaming() {
+        let m = VpnMetrics::new();
+        assert_eq!(m.roaming_events.load(Ordering::Relaxed), 0);
+        m.record_roaming();
+        m.record_roaming();
+        assert_eq!(m.roaming_events.load(Ordering::Relaxed), 2);
+    }
 }

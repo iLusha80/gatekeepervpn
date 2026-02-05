@@ -252,4 +252,32 @@ mod tests {
         assert_eq!(parsed_cookie, cookie);
         assert_eq!(&parsed_payload[..], &handshake_data[..]);
     }
+
+    #[test]
+    fn test_max_payload_64kb() {
+        let large = vec![0xAA; 64 * 1024];
+        let packet = Packet::data(large.clone());
+        let encoded = packet.encode();
+        let decoded = Packet::decode(encoded).unwrap();
+        assert_eq!(decoded.packet_type, PacketType::Data);
+        assert_eq!(decoded.payload.len(), 64 * 1024);
+        assert_eq!(&decoded.payload[..], &large[..]);
+    }
+
+    #[test]
+    fn test_single_byte_payload() {
+        let packet = Packet::data(vec![0x42]);
+        let encoded = packet.encode();
+        assert_eq!(encoded.len(), 2); // 1 type + 1 payload
+        let decoded = Packet::decode(encoded).unwrap();
+        assert_eq!(decoded.packet_type, PacketType::Data);
+        assert_eq!(&decoded.payload[..], &[0x42]);
+    }
+
+    #[test]
+    fn test_parse_cookie_and_payload_too_short() {
+        let packet = Packet::new(PacketType::HandshakeInitCookie, vec![0u8; 16]); // < 32 bytes
+        let result = packet.parse_cookie_and_payload();
+        assert!(matches!(result, Err(Error::InvalidPacket)));
+    }
 }

@@ -480,4 +480,150 @@ mod tests {
         let result = initiator.into_transport();
         assert!(matches!(result, Err(Error::HandshakeNotCompleted)));
     }
+
+    // Helper: complete handshake and return (client_transport, server_transport)
+    fn make_transport_pair() -> (Transport, Transport) {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_t = initiator.into_transport().unwrap();
+        let server_t = responder.into_transport().unwrap();
+        (client_t, server_t)
+    }
+
+    // ===== SlidingWindow tests (through Transport) =====
+
+    #[test]
+    fn test_sliding_window_sequential_nonces() {
+        let (client_t, server_t) = make_transport_pair();
+        for i in 0..10u32 {
+            let ct = client_t.encrypt(&i.to_le_bytes()).unwrap();
+            let pt = server_t.decrypt(&ct).unwrap();
+            assert_eq!(pt, i.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_replay_rejected() {
+        let (client_t, server_t) = make_transport_pair();
+        let ct = client_t.encrypt(b"msg").unwrap();
+        server_t.decrypt(&ct).unwrap();
+        // Second decrypt of same ciphertext must fail
+        assert!(matches!(server_t.decrypt(&ct), Err(Error::ReplayedPacket)));
+    }
+
+    #[test]
+    fn test_sliding_window_out_of_order() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt 3 messages (nonces 0,1,2)
+        let ct0 = client_t.encrypt(b"zero").unwrap();
+        let ct1 = client_t.encrypt(b"one").unwrap();
+        let ct2 = client_t.encrypt(b"two").unwrap();
+        // Decrypt in order 2, 0, 1
+        assert_eq!(server_t.decrypt(&ct2).unwrap(), b"two");
+        assert_eq!(server_t.decrypt(&ct0).unwrap(), b"zero");
+        assert_eq!(server_t.decrypt(&ct1).unwrap(), b"one");
+    }
+
+    #[test]
+    fn test_sliding_window_too_old_nonce() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt first message (nonce 0)
+        let ct_old = client_t.encrypt(b"old").unwrap();
+        // Advance nonce beyond window (WINDOW_SIZE = 2048)
+        for _ in 0..2049 {
+            let ct = client_t.encrypt(b"x").unwrap();
+            server_t.decrypt(&ct).unwrap();
+        }
+        // Now nonce 0 is outside the window
+        assert!(matches!(
+            server_t.decrypt(&ct_old),
+            Err(Error::ReplayedPacket)
+        ));
+    }
+
+    #[test]
+    fn test_sliding_window_large_gap() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt but skip some nonces (encrypt 1000 messages, only decrypt last)
+        let mut ciphertexts = Vec::new();
+        for i in 0..1001u32 {
+            ciphertexts.push(client_t.encrypt(&i.to_le_bytes()).unwrap());
+        }
+        // Decrypt only the last one — big jump from 0 to 1000
+        let pt = server_t.decrypt(&ciphertexts[1000]).unwrap();
+        assert_eq!(pt, 1000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_sliding_window_full_reset_beyond_window() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt a few messages
+        for _ in 0..5 {
+            let ct = client_t.encrypt(b"a").unwrap();
+            server_t.decrypt(&ct).unwrap();
+        }
+        // Skip more than WINDOW_SIZE nonces
+        for _ in 0..2100 {
+            client_t.encrypt(b"skip").unwrap(); // not decrypted
+        }
+        // Now encrypt and decrypt — should work (bitmap was fully reset)
+        let ct = client_t.encrypt(b"after_reset").unwrap();
+        assert_eq!(server_t.decrypt(&ct).unwrap(), b"after_reset");
+    }
+
+    #[test]
+    fn test_sliding_window_boundary_edge() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt messages with nonces 0..=2047 (fill window exactly)
+        let mut cts: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..2048 {
+            cts.push(client_t.encrypt(b"b").unwrap());
+        }
+        // Decrypt only the last one (nonce 2047)
+        server_t.decrypt(&cts[2047]).unwrap();
+        // Nonce 0 is exactly at boundary: highest(2047) - 0 = 2047 < WINDOW_SIZE(2048) => still valid
+        assert!(server_t.decrypt(&cts[0]).is_ok());
+    }
+
+    #[test]
+    fn test_sliding_window_many_packets() {
+        let (client_t, server_t) = make_transport_pair();
+        for i in 0..5000u32 {
+            let ct = client_t.encrypt(&i.to_le_bytes()).unwrap();
+            let pt = server_t.decrypt(&ct).unwrap();
+            assert_eq!(pt, i.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn test_transport_empty_payload() {
+        let (client_t, server_t) = make_transport_pair();
+        let ct = client_t.encrypt(b"").unwrap();
+        let pt = server_t.decrypt(&ct).unwrap();
+        assert!(pt.is_empty());
+    }
+
+    #[test]
+    fn test_handshake_wrong_server_key() {
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+        let wrong_keys = generate_keypair().unwrap();
+
+        // Client uses wrong server public key
+        let mut initiator = Initiator::new(&client_keys.private, &wrong_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        // Responder should fail to read — wrong static key
+        assert!(responder.read_message(&msg1).is_err());
+    }
 }
