@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use rand::Rng;
 use tokio::net::UdpSocket;
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 
 use gatekeeper_common::{
     ClientConfig, DnsConfig, DnsState, Error as CommonError, Packet, PacketObfuscator, PacketType,
@@ -54,6 +55,18 @@ fn is_network_unreachable(e: &std::io::Error) -> bool {
     )
 }
 
+/// Generate a jittered keepalive interval (±30% of base).
+/// For base=25s, returns a random duration in [17, 33] seconds.
+pub fn jittered_keepalive_interval(base_secs: u64) -> Duration {
+    if base_secs == 0 {
+        return Duration::from_secs(3600);
+    }
+    let min = (base_secs as f64 * 0.7) as u64;
+    let max = (base_secs as f64 * 1.3) as u64;
+    let jittered = rand::rng().random_range(min..=max);
+    Duration::from_secs(jittered)
+}
+
 /// Reason why the VPN data loop exited
 pub enum VpnExitReason {
     /// Graceful shutdown (SIGINT/SIGTERM)
@@ -82,15 +95,13 @@ async fn run_vpn_loop(
     let mut tun_buf = vec![0u8; 65535];
     let mut udp_buf = vec![0u8; 65535];
 
-    let mut keepalive_ticker = interval(Duration::from_secs(if keepalive_interval > 0 {
-        keepalive_interval
-    } else {
-        3600 // effectively disabled
-    }));
+    let keepalive_sleep = tokio::time::sleep(jittered_keepalive_interval(keepalive_interval));
+    // Pin for reuse in select!
+    tokio::pin!(keepalive_sleep);
 
     if keepalive_interval > 0 {
         log::info!(
-            "Keep-alive enabled: interval={}s, timeout={}s",
+            "Keep-alive enabled: interval={}s (±30% jitter), timeout={}s",
             keepalive_interval,
             keepalive_timeout
         );
@@ -168,9 +179,10 @@ async fn run_vpn_loop(
                     }
                 }
             }
-            // Keep-alive sender + timeout check
-            _ = keepalive_ticker.tick() => {
+            // Keep-alive sender + timeout check (jittered interval)
+            _ = &mut keepalive_sleep => {
                 if keepalive_interval == 0 {
+                    keepalive_sleep.set(tokio::time::sleep(Duration::from_secs(3600)));
                     continue;
                 }
                 let since_last = conn_state.seconds_since_last_received();
@@ -188,6 +200,8 @@ async fn run_vpn_loop(
                 } else {
                     log::debug!("KeepAlive sent");
                 }
+                // Schedule next keepalive with new random jitter
+                keepalive_sleep.set(tokio::time::sleep(jittered_keepalive_interval(keepalive_interval)));
             }
             // Shutdown signal
             _ = shutdown_signal() => {
@@ -376,4 +390,64 @@ pub async fn run_vpn_mode(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_jittered_keepalive_interval_range() {
+        // base=25s → range [17, 33]
+        for _ in 0..1000 {
+            let d = jittered_keepalive_interval(25);
+            let secs = d.as_secs();
+            assert!(
+                (17..=33).contains(&secs),
+                "jittered interval {} out of range [17, 33]",
+                secs
+            );
+        }
+    }
+
+    #[test]
+    fn test_jittered_keepalive_interval_zero_disabled() {
+        let d = jittered_keepalive_interval(0);
+        assert_eq!(
+            d.as_secs(),
+            3600,
+            "zero base should return 3600s (disabled)"
+        );
+    }
+
+    #[test]
+    fn test_jittered_keepalive_interval_mean_near_base() {
+        let n = 10_000;
+        let base = 25u64;
+        let sum: u64 = (0..n)
+            .map(|_| jittered_keepalive_interval(base).as_secs())
+            .sum();
+        let mean = sum as f64 / n as f64;
+        // Mean should be approximately 25 (within ±2)
+        assert!(
+            (mean - base as f64).abs() < 2.0,
+            "mean {} too far from base {}",
+            mean,
+            base
+        );
+    }
+
+    #[test]
+    fn test_jittered_keepalive_interval_not_constant() {
+        // Verify jitter actually varies (not all same value)
+        let values: Vec<u64> = (0..100)
+            .map(|_| jittered_keepalive_interval(25).as_secs())
+            .collect();
+        let unique: std::collections::HashSet<u64> = values.into_iter().collect();
+        assert!(
+            unique.len() > 1,
+            "jittered intervals should vary, got only {:?}",
+            unique
+        );
+    }
 }

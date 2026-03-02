@@ -404,7 +404,7 @@ async fn test_junk_packets_ignored() {
 
     // Send junk first
     for _ in 0..3 {
-        let junk = client_obf.generate_junk_packet();
+        let junk = client_obf.generate_junk_packet(None);
         client_socket.send(&junk).await.unwrap();
     }
 

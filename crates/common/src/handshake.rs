@@ -4,11 +4,17 @@
 //! - Initiator (client) knows responder's (server) static public key
 //! - Provides mutual authentication and forward secrecy
 
+use blake2::Blake2sMac;
+use blake2::digest::Mac;
+use blake2::digest::consts::U8;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Error;
 use crate::crypto::NOISE_PATTERN;
+
+/// BLAKE2s MAC producing 8-byte output for counter mask derivation
+type Blake2sMac64 = Blake2sMac<U8>;
 
 /// Maximum size for handshake messages
 pub const MAX_HANDSHAKE_MSG_SIZE: usize = 256;
@@ -63,8 +69,9 @@ impl Initiator {
         if !self.state.is_handshake_finished() {
             return Err(Error::HandshakeNotCompleted);
         }
+        let handshake_hash = self.state.get_handshake_hash().to_vec();
         let transport = self.state.into_stateless_transport_mode()?;
-        Ok(Transport::new(transport))
+        Ok(Transport::new(transport, &handshake_hash))
     }
 }
 
@@ -121,8 +128,9 @@ impl Responder {
         if !self.state.is_handshake_finished() {
             return Err(Error::HandshakeNotCompleted);
         }
+        let handshake_hash = self.state.get_handshake_hash().to_vec();
         let transport = self.state.into_stateless_transport_mode()?;
-        Ok(Transport::new(transport))
+        Ok(Transport::new(transport, &handshake_hash))
     }
 }
 
@@ -136,6 +144,8 @@ pub struct Transport {
     send_counter: AtomicU64,
     /// Sliding window for replay protection
     recv_window: SlidingWindow,
+    /// XOR mask for counter bytes on the wire (anti-DPI: hides monotonic counter)
+    counter_mask: [u8; 8],
 }
 
 /// Maximum overhead added by encryption (poly1305 tag + 8-byte counter)
@@ -229,26 +239,63 @@ impl SlidingWindow {
 }
 
 impl Transport {
-    fn new(state: StatelessTransportState) -> Self {
+    fn new(state: StatelessTransportState, handshake_hash: &[u8]) -> Self {
+        // Derive counter_mask from handshake_hash using keyed BLAKE2s
+        let counter_mask = Self::derive_counter_mask(handshake_hash);
         Self {
             state,
             send_counter: AtomicU64::new(0),
             recv_window: SlidingWindow::new(),
+            counter_mask,
         }
+    }
+
+    /// Derive an 8-byte counter mask from the handshake hash.
+    /// Both sides derive the same mask since they share the same handshake_hash.
+    fn derive_counter_mask(handshake_hash: &[u8]) -> [u8; 8] {
+        let mut mac =
+            Blake2sMac64::new_from_slice(b"counter-mask").expect("BLAKE2s accepts any key size");
+        mac.update(handshake_hash);
+        let result = mac.finalize();
+        let bytes = result.into_bytes();
+        let mut mask = [0u8; 8];
+        mask.copy_from_slice(&bytes);
+        mask
+    }
+
+    /// XOR counter bytes with counter_mask for on-wire obfuscation
+    fn mask_counter(&self, counter: u64) -> [u8; 8] {
+        let counter_bytes = counter.to_le_bytes();
+        let mut masked = [0u8; 8];
+        for i in 0..8 {
+            masked[i] = counter_bytes[i] ^ self.counter_mask[i];
+        }
+        masked
+    }
+
+    /// Unmask counter bytes from on-wire format back to real counter
+    fn unmask_counter(&self, masked_bytes: &[u8; 8]) -> u64 {
+        let mut counter_bytes = [0u8; 8];
+        for i in 0..8 {
+            counter_bytes[i] = masked_bytes[i] ^ self.counter_mask[i];
+        }
+        u64::from_le_bytes(counter_bytes)
     }
 
     /// Encrypt a message with explicit counter
     ///
-    /// Returns: [8-byte counter][encrypted ciphertext]
+    /// Returns: [8-byte masked counter][encrypted ciphertext]
+    /// The counter is XORed with counter_mask on the wire to prevent DPI
+    /// from identifying the monotonically increasing plaintext nonce.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
 
         let mut buf = vec![0u8; COUNTER_SIZE + plaintext.len() + TRANSPORT_OVERHEAD];
 
-        // Write counter (little-endian)
-        buf[..COUNTER_SIZE].copy_from_slice(&counter.to_le_bytes());
+        // Write masked counter (anti-DPI: not plaintext monotonic)
+        buf[..COUNTER_SIZE].copy_from_slice(&self.mask_counter(counter));
 
-        // Encrypt with counter as nonce
+        // Encrypt with real counter as nonce (AEAD uses unmasked value)
         let len = self
             .state
             .write_message(counter, plaintext, &mut buf[COUNTER_SIZE..])?;
@@ -263,7 +310,8 @@ impl Transport {
         if data.len() < COUNTER_SIZE + TRANSPORT_OVERHEAD {
             return false;
         }
-        let counter = u64::from_le_bytes(data[..COUNTER_SIZE].try_into().unwrap());
+        let masked_bytes: [u8; 8] = data[..COUNTER_SIZE].try_into().unwrap();
+        let counter = self.unmask_counter(&masked_bytes);
         let ciphertext = &data[COUNTER_SIZE..];
         let mut buf = vec![0u8; ciphertext.len()];
         self.state
@@ -273,21 +321,22 @@ impl Transport {
 
     /// Decrypt a message with explicit counter
     ///
-    /// Input: [8-byte counter][encrypted ciphertext]
+    /// Input: [8-byte masked counter][encrypted ciphertext]
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
         if data.len() < COUNTER_SIZE + TRANSPORT_OVERHEAD {
             return Err(Error::InvalidPacket);
         }
 
-        // Read counter
-        let counter = u64::from_le_bytes(data[..COUNTER_SIZE].try_into().unwrap());
+        // Read and unmask counter
+        let masked_bytes: [u8; 8] = data[..COUNTER_SIZE].try_into().unwrap();
+        let counter = self.unmask_counter(&masked_bytes);
 
-        // Check replay protection
+        // Check replay protection (with real counter)
         if !self.recv_window.check_and_mark(counter) {
             return Err(Error::ReplayedPacket);
         }
 
-        // Decrypt
+        // Decrypt with real counter as nonce
         let ciphertext = &data[COUNTER_SIZE..];
         let mut buf = vec![0u8; ciphertext.len()];
         let len = self.state.read_message(counter, ciphertext, &mut buf)?;
@@ -625,5 +674,92 @@ mod tests {
         let msg1 = initiator.write_message(&[]).unwrap();
         // Responder should fail to read — wrong static key
         assert!(responder.read_message(&msg1).is_err());
+    }
+
+    // ===== Counter mask tests (anti-DPI) =====
+
+    #[test]
+    fn test_counter_mask_not_zero() {
+        let (client_t, _) = make_transport_pair();
+        // counter_mask should not be all zeros (extremely unlikely)
+        assert_ne!(client_t.counter_mask, [0u8; 8]);
+    }
+
+    #[test]
+    fn test_counter_mask_same_for_both_sides() {
+        // Both sides derive the same counter_mask from the same handshake_hash
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_t = initiator.into_transport().unwrap();
+        let server_t = responder.into_transport().unwrap();
+
+        assert_eq!(client_t.counter_mask, server_t.counter_mask);
+    }
+
+    #[test]
+    fn test_masked_counter_differs_from_plaintext() {
+        let (client_t, _) = make_transport_pair();
+        let ciphertext = client_t.encrypt(b"test").unwrap();
+        // The first 8 bytes are the masked counter (nonce=0)
+        let on_wire_counter = &ciphertext[..COUNTER_SIZE];
+        let plaintext_counter = 0u64.to_le_bytes();
+        // With counter_mask != 0, the masked counter should differ from plaintext
+        assert_ne!(on_wire_counter, &plaintext_counter);
+    }
+
+    #[test]
+    fn test_counter_mask_roundtrip() {
+        let (client_t, _) = make_transport_pair();
+        // mask -> unmask should return original counter
+        for counter in [0u64, 1, 42, 1000, u64::MAX] {
+            let masked = client_t.mask_counter(counter);
+            let unmasked = client_t.unmask_counter(&masked);
+            assert_eq!(
+                counter, unmasked,
+                "roundtrip failed for counter {}",
+                counter
+            );
+        }
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_with_counter_mask() {
+        let (client_t, server_t) = make_transport_pair();
+        // Encrypt/decrypt should still work correctly with counter masking
+        for i in 0..100u32 {
+            let msg = format!("message {}", i);
+            let ct = client_t.encrypt(msg.as_bytes()).unwrap();
+            let pt = server_t.decrypt(&ct).unwrap();
+            assert_eq!(pt, msg.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_can_decrypt_with_counter_mask() {
+        let (client_t, server_t) = make_transport_pair();
+        let ct = client_t.encrypt(b"test can_decrypt with mask").unwrap();
+        // can_decrypt should work correctly with masked counter
+        assert!(server_t.can_decrypt(&ct));
+        // After can_decrypt, decrypt should still work
+        let pt = server_t.decrypt(&ct).unwrap();
+        assert_eq!(pt, b"test can_decrypt with mask");
+    }
+
+    #[test]
+    fn test_different_sessions_different_masks() {
+        let (client_t1, _) = make_transport_pair();
+        let (client_t2, _) = make_transport_pair();
+        // Different handshake sessions should produce different counter masks
+        // (because handshake_hash includes ephemeral keys)
+        assert_ne!(client_t1.counter_mask, client_t2.counter_mask);
     }
 }

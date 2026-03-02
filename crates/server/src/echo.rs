@@ -245,7 +245,7 @@ pub(crate) async fn run_echo_mode(
             if response_packet.packet_type == PacketType::HandshakeResponse {
                 let junk_count = obfuscator.junk_count();
                 for _ in 0..junk_count {
-                    let junk = obfuscator.generate_junk_packet();
+                    let junk = obfuscator.generate_junk_packet(None);
                     let _ = socket.send_to(&junk, addr).await;
                 }
             }

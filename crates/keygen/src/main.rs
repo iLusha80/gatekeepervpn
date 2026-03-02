@@ -98,7 +98,7 @@ enum Commands {
         output: Option<PathBuf>,
 
         /// Listen address
-        #[arg(long, default_value = "0.0.0.0:51820")]
+        #[arg(long, default_value = "0.0.0.0:8443")]
         listen: String,
 
         /// TUN interface IP address
@@ -113,7 +113,7 @@ enum Commands {
         server_key: String,
 
         /// Server address
-        #[arg(long, default_value = "127.0.0.1:51820")]
+        #[arg(long, default_value = "127.0.0.1:8443")]
         server: String,
 
         /// Output file path (stdout if not specified)
@@ -152,7 +152,7 @@ enum Commands {
         /// Client name (e.g., "laptop-ilya")
         name: String,
 
-        /// Server address for client config (e.g., "vpn.example.com:51820")
+        /// Server address for client config (e.g., "vpn.example.com:8443")
         #[arg(long)]
         server_address: Option<String>,
 
@@ -699,7 +699,7 @@ fn add_client(
     };
 
     // Get server address
-    let server = server_address.unwrap_or_else(|| "YOUR_SERVER_ADDRESS:51820".to_string());
+    let server = server_address.unwrap_or_else(|| "YOUR_SERVER_ADDRESS:8443".to_string());
 
     // Create peer config
     let peer = PeerConfig::new(name.clone(), public_key.clone(), assigned_ip);

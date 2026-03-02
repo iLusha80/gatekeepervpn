@@ -10,6 +10,7 @@ use rand::Rng;
 
 use crate::Error;
 use crate::config::ObfuscationConfig;
+use crate::handshake::Transport;
 use crate::protocol::Packet;
 
 /// Packet obfuscator/deobfuscator
@@ -187,9 +188,31 @@ impl PacketObfuscator {
         Packet::decode(restored.freeze())
     }
 
-    /// Generate a junk packet (random bytes, 16-128 bytes)
-    pub fn generate_junk_packet(&self) -> Bytes {
+    /// Generate a junk packet.
+    ///
+    /// If `transport` is provided (post-handshake), generates an AEAD-encrypted
+    /// Data packet with random payload — indistinguishable from real traffic for DPI.
+    /// The receiver will decrypt it successfully but discard the non-IP payload.
+    ///
+    /// If `transport` is None (pre-handshake), falls back to random bytes.
+    pub fn generate_junk_packet(&self, transport: Option<&Transport>) -> Bytes {
         let mut rng = rand::rng();
+
+        if let Some(transport) = transport {
+            // Generate random payload (random size 0-64 bytes)
+            let payload_size = rng.random_range(0..=64);
+            let mut payload = vec![0u8; payload_size];
+            if payload_size > 0 {
+                rng.fill(&mut payload[..]);
+            }
+            // Encrypt through Transport — produces a valid AEAD ciphertext
+            if let Ok(encrypted) = transport.encrypt(&payload) {
+                let packet = Packet::data(encrypted);
+                return self.obfuscate(&packet);
+            }
+        }
+
+        // Fallback: random bytes (pre-handshake or encrypt error)
         let size = rng.random_range(16..=128);
         let mut data = vec![0u8; size];
         rng.fill(&mut data[..]);
@@ -400,9 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn test_junk_packet_generation() {
+    fn test_junk_packet_generation_no_transport() {
         let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
-        let junk = obf.generate_junk_packet();
+        let junk = obf.generate_junk_packet(None);
         assert!(junk.len() >= 16 && junk.len() <= 128);
     }
 
@@ -448,6 +471,67 @@ mod tests {
     fn test_explicit_psk_no_generated() {
         let obf = PacketObfuscator::new(&enabled_config(), &test_server_pubkey()).unwrap();
         assert!(obf.generated_psk().is_none());
+    }
+
+    #[test]
+    fn test_junk_packet_with_transport_is_decryptable() {
+        use crate::crypto::generate_keypair;
+        use crate::handshake::{Initiator, Responder};
+
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let client_transport = initiator.into_transport().unwrap();
+        let server_transport = responder.into_transport().unwrap();
+
+        let obf = PacketObfuscator::new(&enabled_config(), &server_keys.public).unwrap();
+
+        // Generate AEAD-encrypted junk
+        let junk = obf.generate_junk_packet(Some(&client_transport));
+
+        // Should be deobfuscatable as a Data packet
+        let deobfuscated = obf.deobfuscate(junk).unwrap();
+        assert_eq!(deobfuscated.packet_type, PacketType::Data);
+
+        // The inner payload should be decryptable by the server transport
+        let decrypted = server_transport.decrypt(&deobfuscated.payload);
+        assert!(decrypted.is_ok(), "AEAD junk should be decryptable");
+    }
+
+    #[test]
+    fn test_junk_packet_with_transport_varies() {
+        use crate::crypto::generate_keypair;
+        use crate::handshake::{Initiator, Responder};
+
+        let client_keys = generate_keypair().unwrap();
+        let server_keys = generate_keypair().unwrap();
+
+        let mut initiator = Initiator::new(&client_keys.private, &server_keys.public).unwrap();
+        let mut responder = Responder::new(&server_keys.private).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let transport = initiator.into_transport().unwrap();
+        let obf = PacketObfuscator::new(&enabled_config(), &server_keys.public).unwrap();
+
+        // Generate multiple junk packets — they should all differ
+        let junks: Vec<Bytes> = (0..10)
+            .map(|_| obf.generate_junk_packet(Some(&transport)))
+            .collect();
+
+        let unique: std::collections::HashSet<Vec<u8>> = junks.iter().map(|j| j.to_vec()).collect();
+        assert!(unique.len() > 1, "AEAD junk packets should vary");
     }
 
     #[test]

@@ -199,7 +199,7 @@ pub(crate) async fn run_vpn_mode(
                                     // Send junk packets before handshake response
                                     let junk_count = obfuscator_rx.junk_count();
                                     for _ in 0..junk_count {
-                                        let junk = obfuscator_rx.generate_junk_packet();
+                                        let junk = obfuscator_rx.generate_junk_packet(None);
                                         let _ = socket_rx.send_to(&junk, addr).await;
                                     }
                                     if let Err(e) = socket_rx
@@ -242,7 +242,7 @@ pub(crate) async fn run_vpn_mode(
                                             // Send junk packets before handshake response
                                             let junk_count = obfuscator_rx.junk_count();
                                             for _ in 0..junk_count {
-                                                let junk = obfuscator_rx.generate_junk_packet();
+                                                let junk = obfuscator_rx.generate_junk_packet(None);
                                                 let _ = socket_rx.send_to(&junk, addr).await;
                                             }
                                             if let Err(e) = socket_rx

@@ -47,7 +47,7 @@ pub async fn perform_handshake(
     // Send junk packets before handshake init
     let junk_count = obfuscator.junk_count();
     for _ in 0..junk_count {
-        let junk = obfuscator.generate_junk_packet();
+        let junk = obfuscator.generate_junk_packet(None);
         let _ = socket.send(&junk).await;
     }
 

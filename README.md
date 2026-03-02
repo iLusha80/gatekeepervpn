@@ -106,7 +106,7 @@ gkvpn init --subnet 10.10.10.0 --mask 24
 #### 3. Добавление клиента
 
 ```bash
-gkvpn add "laptop-ilya" --server-address vpn.example.com:51820
+gkvpn add "laptop-ilya" --server-address vpn.example.com:8443
 ```
 
 Профиль сохранится в `/etc/gatekeeper/profiles/laptop-ilya.conf`
@@ -179,7 +179,7 @@ sudo gkvpn up laptop
 sudo gkvpn connect laptop --test
 
 # Переопределить сервер
-sudo gkvpn connect laptop -s vpn.example.com:51820
+sudo gkvpn connect laptop -s vpn.example.com:8443
 
 # Verbose-логирование (debug)
 sudo gkvpn connect laptop -v
@@ -271,7 +271,7 @@ VPN-сессия сохраняется при смене IP клиента (WiF
 ### server.toml
 
 ```toml
-listen = "0.0.0.0:51820"
+listen = "0.0.0.0:8443"
 private_key = "base64..."
 
 # TUN interface
@@ -307,7 +307,7 @@ created_at = "2026-01-19T12:00:00Z"
 ### client.conf
 
 ```toml
-server = "vpn.example.com:51820"
+server = "vpn.example.com:8443"
 private_key = "base64..."
 server_public_key = "base64..."
 tun_address = "10.10.10.2"
@@ -472,7 +472,7 @@ netstat -rn | grep "0.0.0.0"
 
 ## Порты и протоколы
 
-- **UDP 51820** — основной порт VPN (можно изменить в `listen`)
+- **UDP 8443** — основной порт VPN (можно изменить в `listen`)
 
 ## Требования
 

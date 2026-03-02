@@ -20,7 +20,7 @@ fi
 
 SERVER_KEY="$1"
 SERVER_IP="$2"
-SERVER_PORT="${3:-51820}"
+SERVER_PORT="${3:-8443}"
 
 # Step 1: Build the project
 echo "[1/3] Building GatekeeperVPN (release mode)..."

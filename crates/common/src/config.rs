@@ -184,7 +184,7 @@ impl Default for ObfuscationConfig {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Listen address (e.g., "0.0.0.0:51820")
+    /// Listen address (e.g., "0.0.0.0:8443")
     pub listen: String,
     /// Server's private key (base64 encoded)
     pub private_key: String,
@@ -256,7 +256,7 @@ fn default_stats_file() -> String {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:51820".to_string(),
+            listen: "0.0.0.0:8443".to_string(),
             private_key: String::new(),
             tun_address: default_server_tun_address(),
             tun_netmask: default_tun_netmask_server(),
@@ -273,7 +273,7 @@ impl Default for ServerConfig {
 /// Client configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-    /// Server address (e.g., "127.0.0.1:51820")
+    /// Server address (e.g., "127.0.0.1:8443")
     pub server: String,
     /// Client's private key (base64 encoded)
     pub private_key: String,
@@ -352,7 +352,7 @@ fn default_max_reconnect_attempts() -> u32 {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            server: "127.0.0.1:51820".to_string(),
+            server: "127.0.0.1:8443".to_string(),
             private_key: String::new(),
             server_public_key: String::new(),
             tun_address: default_tun_address(),
@@ -403,13 +403,13 @@ mod tests {
     #[test]
     fn test_server_config_default() {
         let config = ServerConfig::default();
-        assert_eq!(config.listen, "0.0.0.0:51820");
+        assert_eq!(config.listen, "0.0.0.0:8443");
     }
 
     #[test]
     fn test_client_config_default() {
         let config = ClientConfig::default();
-        assert_eq!(config.server, "127.0.0.1:51820");
+        assert_eq!(config.server, "127.0.0.1:8443");
         assert!(config.dns_servers.is_empty());
     }
 
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn test_server_config_deserialize_with_timeout() {
         let toml_str = r#"
-            listen = "0.0.0.0:51820"
+            listen = "0.0.0.0:8443"
             private_key = "test"
             client_timeout = 600
             stats_file = "/var/run/vpn.stats"
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_server_config_deserialize_without_timeout() {
         let toml_str = r#"
-            listen = "0.0.0.0:51820"
+            listen = "0.0.0.0:8443"
             private_key = "test"
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_client_config_with_dns_servers() {
         let toml_str = r#"
-            server = "1.2.3.4:51820"
+            server = "1.2.3.4:8443"
             private_key = "test"
             server_public_key = "test"
             dns_servers = ["1.1.1.1", "8.8.8.8"]
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_client_config_without_dns_servers() {
         let toml_str = r#"
-            server = "1.2.3.4:51820"
+            server = "1.2.3.4:8443"
             private_key = "test"
             server_public_key = "test"
         "#;
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn test_server_config_with_obfuscation() {
         let toml_str = r#"
-            listen = "0.0.0.0:51820"
+            listen = "0.0.0.0:8443"
             private_key = "test"
 
             [obfuscation]
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn test_server_config_without_obfuscation_section() {
         let toml_str = r#"
-            listen = "0.0.0.0:51820"
+            listen = "0.0.0.0:8443"
             private_key = "test"
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn test_server_config_obfuscation_disabled_explicit() {
         let toml_str = r#"
-            listen = "0.0.0.0:51820"
+            listen = "0.0.0.0:8443"
             private_key = "test"
 
             [obfuscation]
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_client_config_with_obfuscation() {
         let toml_str = r#"
-            server = "1.2.3.4:51820"
+            server = "1.2.3.4:8443"
             private_key = "test"
             server_public_key = "test"
 

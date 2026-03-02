@@ -13,7 +13,9 @@ pub mod obfuscation;
 pub mod protocol;
 pub mod routing;
 pub mod socket;
+pub mod transport_trait;
 pub mod tun_device;
+pub mod udp_transport;
 
 pub use config::{ClientConfig, ObfuscationConfig, PeerConfig, PeersConfig, ServerConfig};
 pub use cookie::{CookieState, HandshakeRateLimiter, RateLimitDecision};
@@ -29,4 +31,6 @@ pub use obfuscation::PacketObfuscator;
 pub use protocol::{Packet, PacketType};
 pub use routing::{RouteConfig, cleanup_routes, setup_routes, update_server_route};
 pub use socket::{DEFAULT_BUFFER_SIZE, configure_socket, configure_socket_buffers};
+pub use transport_trait::{ClientTransport, ServerTransport};
 pub use tun_device::{TunConfig, TunDevice, TunReader, TunWriter};
+pub use udp_transport::{UdpClientTransport, UdpServerTransport};

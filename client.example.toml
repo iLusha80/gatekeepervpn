@@ -1,7 +1,7 @@
 # GatekeeperVPN Client Configuration
 
 # Server address
-server = "127.0.0.1:51820"
+server = "127.0.0.1:8443"
 
 # Client's private key (base64 encoded)
 # Generate with: cargo run --bin gatekeeper-client (will print a new keypair)

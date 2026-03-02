@@ -606,6 +606,7 @@ dependencies = [
  "env_logger",
  "gatekeeper-common",
  "log",
+ "rand",
  "serde",
  "tokio",
  "toml",

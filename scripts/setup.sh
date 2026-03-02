@@ -26,7 +26,7 @@ NC='\033[0m'
 # Default values
 DEFAULT_SUBNET="10.10.10.0"
 DEFAULT_MASK=24
-DEFAULT_PORT=51820
+DEFAULT_PORT=8443
 CONFIG_DIR="/etc/gatekeeper"
 INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
