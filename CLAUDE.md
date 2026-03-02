@@ -150,3 +150,47 @@ pub enum Error {
 * GUI, Mobile SDK
 * Advanced obfuscation (TLS camouflage, QUIC mimicry)
 * Multi-server routing
+
+## Vibe Kanban — Task Management
+
+This project uses **vibe-kanban** for task tracking via MCP.
+Board: http://localhost:3000/projects/0abafe93-63ab-4f02-b297-cb5104e0ea46
+
+### MCP Connection
+
+Endpoint: `http://127.0.0.1:8001/mcp`
+Project ID: `0abafe93-63ab-4f02-b297-cb5104e0ea46`
+
+### Workflow
+
+**STRICT: One task at a time.** Take → implement → complete → next.
+
+1. `list_notes(status="new")` — check for user ideas, create tasks from them
+2. `list_tasks(status="todo")` — see available tasks
+3. `take_task(task_id, agent_id="claude-code")` — claim a task
+4. Implement the task (write code, tests, etc.)
+5. `complete_task(task_id, result_comment="what was done", agent_report="detailed markdown report")`
+6. Tasks with `has_result=true` go to **review** (human checks), others go to **done**
+
+### Available MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `list_tasks` | List tasks. Filter by status/priority/is_blocked/agent_id |
+| `get_task` | Get full task details: description, detail, agent_report |
+| `take_task` | Take a task — sets in_progress, assigns agent_id, starts timer |
+| `complete_task` | Complete task with result_comment and agent_report |
+| `update_task` | Update task fields (description, detail, priority) |
+| `block_task` | Block a task with reason |
+| `unblock_task` | Unblock a task |
+| `create_task` | Create a new task |
+| `list_stages` | List project stages |
+| `list_notes` | List project notes from user |
+| `update_note` | Mark note as processed after creating tasks from it |
+
+### Rules
+
+- Use `agent_id="claude-code"` when taking tasks
+- Write `agent_report` in markdown — describe what was done, which files changed, what to verify
+- Always respond to the user in Russian
+- The board at http://localhost:3000 updates in real-time — human sees cards move
