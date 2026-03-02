@@ -1,9 +1,3 @@
-mod connection;
-mod handshake;
-mod signal;
-mod test_mode;
-mod vpn;
-
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::UdpSocket;
 
+use gatekeeper_client::{connection, handshake, test_mode};
 use gatekeeper_common::config::keys;
 use gatekeeper_common::{ClientConfig, PacketObfuscator};
 

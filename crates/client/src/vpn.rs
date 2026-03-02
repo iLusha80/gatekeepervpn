@@ -55,7 +55,7 @@ fn is_network_unreachable(e: &std::io::Error) -> bool {
 }
 
 /// Reason why the VPN data loop exited
-pub(crate) enum VpnExitReason {
+pub enum VpnExitReason {
     /// Graceful shutdown (SIGINT/SIGTERM)
     Shutdown,
     /// KeepAlive timeout — try soft roam
@@ -198,7 +198,7 @@ async fn run_vpn_loop(
 }
 
 /// VPN mode: setup TUN, routes, DNS, then run data loop with soft roaming support
-pub(crate) async fn run_vpn_mode(
+pub async fn run_vpn_mode(
     socket: Arc<UdpSocket>,
     transport: Arc<Transport>,
     config: &ClientConfig,

@@ -1,7 +1,7 @@
 use tokio::signal;
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
-pub(crate) async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     let ctrl_c = signal::ctrl_c();
 
     #[cfg(unix)]

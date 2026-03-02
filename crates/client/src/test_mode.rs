@@ -8,7 +8,7 @@ use gatekeeper_common::{Packet, PacketObfuscator, PacketType, Transport};
 use crate::handshake::recv_packet;
 
 /// Test mode: send a message and receive echo
-pub(crate) async fn run_test_mode(
+pub async fn run_test_mode(
     socket: &UdpSocket,
     transport: &mut Transport,
     message: &str,

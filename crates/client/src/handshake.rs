@@ -7,9 +7,9 @@ use tokio::time::timeout;
 
 use gatekeeper_common::{Initiator, Packet, PacketObfuscator, PacketType, Transport};
 
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) async fn recv_packet(
+pub async fn recv_packet(
     socket: &UdpSocket,
     timeout_duration: Duration,
     obfuscator: &PacketObfuscator,
@@ -33,7 +33,7 @@ pub(crate) async fn recv_packet(
     }
 }
 
-pub(crate) async fn perform_handshake(
+pub async fn perform_handshake(
     socket: &UdpSocket,
     private_key: &[u8],
     server_public_key: &[u8],

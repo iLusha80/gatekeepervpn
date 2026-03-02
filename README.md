@@ -73,7 +73,7 @@ cargo fmt && cargo clippy
 ```bash
 # На чистом сервере Ubuntu/Debian
 cd /opt
-git clone https://github.com/ArkMaster123/gatekeepervpn.git
+git clone https://github.com/iLusha80/gatekeepervpn.git
 cd gatekeepervpn
 sudo bash scripts/setup.sh
 ```
@@ -84,8 +84,6 @@ sudo bash scripts/setup.sh
 - Генерацию ключей и конфигурации
 - NAT и IP forwarding
 - Systemd-сервис
-
-Подробнее: [ROADMAP.md](ROADMAP.md)
 
 ### Ручная настройка
 
@@ -162,37 +160,61 @@ sudo gatekeeper-server -c server.toml -l 0.0.0.0:51821
 | `-e, --echo` | Echo-режим без TUN (для тестов) |
 | `--no-auth` | Отключить авторизацию по ключам |
 
-### Клиент
+### Клиент (gkvpn connect)
 
 ```bash
-# Полный запуск
-sudo gatekeeper-client -c client.conf
+# Подключение по имени профиля (ищет в /etc/gatekeeper/profiles/)
+sudo gkvpn connect laptop
 
-# Указать сервер вручную (переопределяет config)
-sudo gatekeeper-client -c client.conf -s vpn.example.com:51820
+# Подключение с указанием конфига
+sudo gkvpn connect -c ~/client.conf
 
-# Тестовый режим — handshake + echo-сообщение, без TUN
-cargo run --bin client -- --test -c client.conf
+# Если один профиль — подключается автоматически
+sudo gkvpn connect
 
-# Тестовый режим с кастомным сообщением
-cargo run --bin client -- --test -m "ping" -c client.conf
+# Алиас: up
+sudo gkvpn up laptop
+
+# Тестовый режим — handshake + echo, без TUN
+sudo gkvpn connect laptop --test
+
+# Переопределить сервер
+sudo gkvpn connect laptop -s vpn.example.com:51820
+
+# Verbose-логирование (debug)
+sudo gkvpn connect laptop -v
+
+# Отключение
+sudo gkvpn disconnect    # или: gkvpn down
 ```
 
-**Параметры клиента:**
+**Параметры connect:**
 
 | Флаг | Описание |
 |------|----------|
-| `-c, --config` | Путь к файлу конфигурации (по умолчанию `client.toml`) |
+| `[profile]` | Имя профиля или путь к конфигу |
+| `-c, --config` | Явный путь к файлу конфигурации |
 | `-s, --server` | Адрес сервера (переопределяет config) |
+| `-v, --verbose` | Debug-логирование |
 | `-t, --test` | Тестовый режим: handshake + echo, без TUN |
 | `-m, --message` | Сообщение для test mode |
 
-### Генерация ключей (gkvpn)
+**Также доступен прямой запуск:** `sudo gatekeeper-client -c client.conf`
+
+### Управление (gkvpn)
 
 ```bash
-gkvpn generate-server         # Сгенерировать конфиг сервера с ключами
+# VPN
+gkvpn connect <profile>       # Подключиться к VPN
+gkvpn disconnect               # Отключиться от VPN
+gkvpn status                   # Статус сервера
+
+# Ключи и конфигурация
+gkvpn generate-server          # Сгенерировать конфиг сервера с ключами
 gkvpn generate-client          # Сгенерировать конфиг клиента
 gkvpn show-public --key "..."  # Показать публичный ключ из приватного
+
+# Управление клиентами
 gkvpn init                     # Инициализация peers.toml
 gkvpn add "name"               # Добавить клиента с авто-выделением IP
 gkvpn remove "name"            # Удалить клиента

@@ -10,7 +10,7 @@ use crate::handshake::perform_handshake;
 use crate::vpn::run_vpn_mode;
 
 /// Single connection attempt (connect, handshake, run VPN)
-pub(crate) async fn run_vpn_connection(
+pub async fn run_vpn_connection(
     config: &ClientConfig,
     private_key: &[u8],
     server_public_key: &[u8],
@@ -40,7 +40,7 @@ pub(crate) async fn run_vpn_connection(
 }
 
 /// Run VPN with reconnection support
-pub(crate) async fn run_with_reconnect(
+pub async fn run_with_reconnect(
     config: &ClientConfig,
     private_key: &[u8],
     server_public_key: &[u8],

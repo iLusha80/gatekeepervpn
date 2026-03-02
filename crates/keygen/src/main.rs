@@ -1,11 +1,17 @@
 //! GatekeeperVPN CLI tool (gkvpn)
 //!
-//! Manages keypairs, server configuration, and client profiles.
+//! Unified management and VPN client CLI.
 //!
-//! # Commands
+//! # VPN Commands
+//! - `connect` / `up` - Connect to VPN server
+//! - `disconnect` / `down` - Disconnect from VPN
+//! - `status` - Show VPN server status
+//!
+//! # Management Commands
 //! - `generate-server` - Generate server keypair and configuration
 //! - `generate-client` - Generate standalone client configuration
 //! - `show-public` - Show public key from private key
+//! - `init` - Initialize peers configuration
 //! - `add` - Add a new client profile
 //! - `remove` - Remove a client profile
 //! - `list` - List all client profiles
@@ -15,6 +21,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -22,7 +29,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use gatekeeper_common::config::keys;
 use gatekeeper_common::crypto::generate_keypair;
-use gatekeeper_common::{ClientConfig, PeerConfig, PeersConfig, ServerConfig};
+use gatekeeper_common::{ClientConfig, PacketObfuscator, PeerConfig, PeersConfig, ServerConfig};
 
 /// Default configuration directory
 const DEFAULT_CONFIG_DIR: &str = "/etc/gatekeeper";
@@ -30,10 +37,12 @@ const DEFAULT_CONFIG_DIR: &str = "/etc/gatekeeper";
 const PEERS_FILE: &str = "peers.toml";
 /// Default profiles directory name
 const PROFILES_DIR: &str = "profiles";
+/// Default PID file path
+const PID_FILE: &str = "/var/run/gkvpn.pid";
 
 #[derive(Parser)]
 #[command(name = "gkvpn")]
-#[command(about = "GatekeeperVPN management CLI")]
+#[command(about = "GatekeeperVPN — fast & secure VPN")]
 #[command(version)]
 struct Cli {
     /// Configuration directory
@@ -46,6 +55,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Connect to VPN server
+    #[command(alias = "up")]
+    Connect {
+        /// Profile name (looks in /etc/gatekeeper/profiles/<name>.conf)
+        /// or path to config file
+        profile: Option<String>,
+
+        /// Path to config file (overrides profile)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Server address (overrides config)
+        #[arg(short, long)]
+        server: Option<String>,
+
+        /// Verbose output (debug logging)
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Test mode: handshake + echo message, no TUN
+        #[arg(short, long)]
+        test: bool,
+
+        /// Message to send in test mode
+        #[arg(short, long, default_value = "Hello from GatekeeperVPN!")]
+        message: String,
+    },
+
+    /// Disconnect from VPN (stop running gkvpn connect)
+    #[command(alias = "down")]
+    Disconnect {
+        /// PID file path
+        #[arg(long, default_value = PID_FILE)]
+        pid_file: PathBuf,
+    },
+
     /// Generate server keypair and configuration
     GenerateServer {
         /// Output file path (stdout if not specified)
@@ -146,10 +191,33 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Connect {
+            profile,
+            config,
+            server,
+            verbose,
+            test,
+            message,
+        } => {
+            cmd_connect(
+                &cli.config_dir,
+                profile,
+                config,
+                server,
+                verbose,
+                test,
+                message,
+            )
+            .await
+        }
+
+        Commands::Disconnect { pid_file } => cmd_disconnect(&pid_file),
+
         Commands::GenerateServer {
             output,
             listen,
@@ -188,6 +256,235 @@ fn main() -> Result<()> {
 
         Commands::Status { stats_file } => show_status(&stats_file),
     }
+}
+
+// ============================================================================
+// VPN connect / disconnect
+// ============================================================================
+
+/// Resolve config file path from profile name or explicit path
+fn resolve_config_path(
+    config_dir: &Path,
+    profile: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<PathBuf> {
+    // Explicit --config takes priority
+    if let Some(path) = config {
+        if !path.exists() {
+            bail!("Config file not found: {}", path.display());
+        }
+        return Ok(path);
+    }
+
+    // Profile name: look in profiles directory
+    if let Some(name) = profile {
+        // Check if it's already a file path
+        let as_path = Path::new(&name);
+        if as_path.exists() {
+            return Ok(as_path.to_path_buf());
+        }
+
+        // Look in profiles directory
+        let profile_path = config_dir.join(PROFILES_DIR).join(format!("{}.conf", name));
+        if profile_path.exists() {
+            return Ok(profile_path);
+        }
+
+        bail!(
+            "Profile '{}' not found.\n  Looked in: {}\n  Use 'gkvpn list' to see available profiles.\n  Or specify full path: gkvpn connect -c /path/to/config.conf",
+            name,
+            profile_path.display()
+        );
+    }
+
+    // No profile, no config: look for single profile or default
+    let profiles_dir = config_dir.join(PROFILES_DIR);
+    if profiles_dir.exists() {
+        let entries: Vec<_> = fs::read_dir(&profiles_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "conf" || ext == "toml")
+            })
+            .collect();
+
+        if entries.len() == 1 {
+            return Ok(entries[0].path());
+        }
+
+        if entries.len() > 1 {
+            let names: Vec<String> = entries
+                .iter()
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                })
+                .collect();
+            bail!(
+                "Multiple profiles found. Specify one:\n  {}\n\nUsage: gkvpn connect <profile-name>",
+                names.join("\n  ")
+            );
+        }
+    }
+
+    // Fall back to client.toml in current directory
+    let default_path = PathBuf::from("client.toml");
+    if default_path.exists() {
+        return Ok(default_path);
+    }
+
+    bail!(
+        "No config file found.\n  Use: gkvpn connect <profile-name>\n  Or:  gkvpn connect -c /path/to/config.conf\n  Available profiles: gkvpn list"
+    );
+}
+
+async fn cmd_connect(
+    config_dir: &Path,
+    profile: Option<String>,
+    config: Option<PathBuf>,
+    server_override: Option<String>,
+    verbose: bool,
+    test: bool,
+    message: String,
+) -> Result<()> {
+    // Init logging
+    let log_level = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+
+    // Resolve config file
+    let config_path = resolve_config_path(config_dir, profile, config)?;
+    log::info!("Using config: {}", config_path.display());
+
+    // Load config
+    let content = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+    let mut client_config: ClientConfig = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config: {}", config_path.display()))?;
+
+    // Override server address
+    if let Some(server) = server_override {
+        client_config.server = server;
+    }
+
+    // Validate
+    if client_config.private_key.is_empty() {
+        log::warn!("No private key configured, generating ephemeral keypair");
+        let keypair = generate_keypair()?;
+        client_config.private_key = keys::encode(&keypair.private);
+        log::info!("Client public key: {}", keys::encode(&keypair.public));
+    }
+
+    if client_config.server_public_key.is_empty() {
+        bail!("Server public key is required. Set 'server_public_key' in config.");
+    }
+
+    let private_key =
+        keys::decode(&client_config.private_key).context("Invalid private key format")?;
+    let server_public_key =
+        keys::decode(&client_config.server_public_key).context("Invalid server public key")?;
+
+    // Create obfuscator
+    let obfuscator = PacketObfuscator::new(&client_config.obfuscation, &server_public_key)
+        .context("Failed to create packet obfuscator")?;
+    if client_config.obfuscation.enabled {
+        log::info!(
+            "Packet obfuscation enabled (header_size={}, padding={}-{}, junk={}-{})",
+            client_config.obfuscation.header_size,
+            client_config.obfuscation.min_padding,
+            client_config.obfuscation.max_padding,
+            client_config.obfuscation.junk_min,
+            client_config.obfuscation.junk_max
+        );
+    }
+    let obfuscator = Arc::new(obfuscator);
+
+    // Write PID file (best-effort, may fail without root)
+    let pid = std::process::id();
+    if let Err(e) = fs::write(PID_FILE, pid.to_string()) {
+        log::debug!(
+            "Could not write PID file {}: {} (non-critical)",
+            PID_FILE,
+            e
+        );
+    }
+
+    let result = if test {
+        // Test mode
+        use tokio::net::UdpSocket;
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket
+            .connect(&client_config.server)
+            .await
+            .with_context(|| format!("Failed to connect to {}", client_config.server))?;
+        log::info!("Connecting to server: {}", client_config.server);
+
+        let mut transport = gatekeeper_client::handshake::perform_handshake(
+            &socket,
+            &private_key,
+            &server_public_key,
+            &obfuscator,
+        )
+        .await?;
+        gatekeeper_client::test_mode::run_test_mode(&socket, &mut transport, &message, &obfuscator)
+            .await
+    } else {
+        // VPN mode with reconnection
+        gatekeeper_client::connection::run_with_reconnect(
+            &client_config,
+            &private_key,
+            &server_public_key,
+            obfuscator,
+        )
+        .await
+    };
+
+    // Cleanup PID file
+    let _ = fs::remove_file(PID_FILE);
+
+    result
+}
+
+fn cmd_disconnect(pid_file: &Path) -> Result<()> {
+    if !pid_file.exists() {
+        bail!(
+            "PID file not found: {}\nIs gkvpn connect running?",
+            pid_file.display()
+        );
+    }
+
+    let content = fs::read_to_string(pid_file)
+        .with_context(|| format!("Failed to read PID file: {}", pid_file.display()))?;
+
+    let pid: i32 = content
+        .trim()
+        .parse()
+        .with_context(|| format!("Invalid PID in file: '{}'", content.trim()))?;
+
+    // Check if process exists
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    if !exists {
+        // Process doesn't exist, clean up stale PID file
+        let _ = fs::remove_file(pid_file);
+        bail!("Process {} is not running (stale PID file removed)", pid);
+    }
+
+    // Send SIGTERM
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result != 0 {
+        bail!(
+            "Failed to send SIGTERM to process {}. Try: sudo gkvpn disconnect",
+            pid
+        );
+    }
+
+    eprintln!("Sent SIGTERM to gkvpn (PID {})", pid);
+
+    // Clean up PID file
+    let _ = fs::remove_file(pid_file);
+
+    Ok(())
 }
 
 // ============================================================================
@@ -799,6 +1096,7 @@ fn netmask_from_cidr(mask: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_roundtrip_keypair() {
@@ -875,5 +1173,64 @@ mod tests {
             first_client_ip("10.10.10.0").unwrap(),
             Ipv4Addr::new(10, 10, 10, 2)
         );
+    }
+
+    #[test]
+    fn test_resolve_config_path_explicit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("test.conf");
+        fs::write(&config_file, "test").unwrap();
+
+        let result = resolve_config_path(dir.path(), None, Some(config_file.clone()));
+        assert_eq!(result.unwrap(), config_file);
+    }
+
+    #[test]
+    fn test_resolve_config_path_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles_dir = dir.path().join(PROFILES_DIR);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let profile = profiles_dir.join("laptop.conf");
+        fs::write(&profile, "test").unwrap();
+
+        let result = resolve_config_path(dir.path(), Some("laptop".to_string()), None);
+        assert_eq!(result.unwrap(), profile);
+    }
+
+    #[test]
+    fn test_resolve_config_path_single_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles_dir = dir.path().join(PROFILES_DIR);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let profile = profiles_dir.join("my-vpn.conf");
+        fs::write(&profile, "test").unwrap();
+
+        let result = resolve_config_path(dir.path(), None, None);
+        assert_eq!(result.unwrap(), profile);
+    }
+
+    #[test]
+    fn test_resolve_config_path_multiple_profiles_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles_dir = dir.path().join(PROFILES_DIR);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(profiles_dir.join("a.conf"), "test").unwrap();
+        fs::write(profiles_dir.join("b.conf"), "test").unwrap();
+
+        let result = resolve_config_path(dir.path(), None, None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Multiple profiles")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_path_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_config_path(dir.path(), Some("nonexistent".to_string()), None);
+        assert!(result.is_err());
     }
 }
